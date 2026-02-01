@@ -1,0 +1,5 @@
+# Nixpacks configuration for Railway
+# Adds FFmpeg for video processing
+
+[phases.setup]
+nixPkgs = ["ffmpeg"]
