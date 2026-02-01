@@ -1,11 +1,7 @@
-# Nudity detection and censoring
-nudenet>=3.4.0
-onnxruntime>=1.18.0
-
 # Poe Protocol
 fastapi-poe==0.0.48
 
-# Web framework
+# Web framework (included by fastapi-poe, but explicit for clarity)
 fastapi==0.109.2
 uvicorn[standard]==0.27.1
 
@@ -26,3 +22,10 @@ python-dotenv>=1.0.0
 
 # SSE support
 sse-starlette==1.8.2
+
+# Nudity detection and censoring
+# IMPORTANT: opencv-python-headless MUST be installed before nudenet
+# to avoid X11/libxcb dependency issues on headless servers
+opencv-python-headless>=4.8.0
+nudenet>=3.4.0
+onnxruntime>=1.18.0
