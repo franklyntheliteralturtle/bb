@@ -51,7 +51,7 @@ NUDENET_320N_URLS = [
     "https://huggingface.co/vladmandic/nudenet/resolve/main/nudenet.onnx",
 ]
 NUDENET_640M_URLS = [
-    "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/640m.onnx",
+    "https://huggingface.co/spaces/xxparthparekhxx/NudeNet-FastAPI/resolve/794a185a301917f1a3505ab3b8d55b268ea81f0e/640m.onnx",
 ]
 
 NUDENET_320N_PATH = MODEL_CACHE_DIR / "320n.onnx"
