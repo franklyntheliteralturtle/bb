@@ -45,12 +45,13 @@ SERVER_URL = os.getenv("SERVER_URL", "")
 # NudeNet model URLs - using dual models for better coverage
 # 320n: Fast, lightweight model (~6MB)
 # 640m: Larger, more accurate model (~25MB)
+# Using Hugging Face mirrors for reliable downloads
 NUDENET_320N_URLS = [
+    "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/320n.onnx",
     "https://huggingface.co/vladmandic/nudenet/resolve/main/nudenet.onnx",
-    "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.onnx",
 ]
 NUDENET_640M_URLS = [
-    "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx",
+    "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/640m.onnx",
 ]
 
 NUDENET_320N_PATH = MODEL_CACHE_DIR / "320n.onnx"
