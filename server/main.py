@@ -684,11 +684,50 @@ class RedGifsClient:
         api.login()
         return api
 
-    async def search(self, query: str, page: int = 1, count: int = 20) -> dict:
+    async def search(self, query: str, page: int = 1, count: int = 20, order: str = "latest") -> dict:
+        """
+        Search for GIFs by tag/query.
+
+        Args:
+            query: Tag or search term
+            page: Page number (1-indexed)
+            count: Number of results per page
+            order: Sort order - "latest", "trending", "top", "top7", "top28"
+        """
         api = await self.get_api()
-        result = await asyncio.to_thread(
-            api.search, query, order=Order.TRENDING, count=count, page=page
-        )
+
+        # Map order string to Order enum
+        order_map = {
+            "latest": Order.LATEST,
+            "new": Order.LATEST,
+            "trending": Order.TRENDING,
+            "top": Order.TOP,
+            "top7": Order.TOP7,
+            "top28": Order.TOP28,
+            "best": Order.BEST,
+        }
+        order_enum = order_map.get(order.lower(), Order.LATEST)
+
+        # Use search_gifs for tag-based searching
+        # This searches specifically by tags rather than general text
+        try:
+            result = await asyncio.to_thread(
+                api.search_gifs,
+                tags=[query],  # Pass as list of tags
+                order=order_enum,
+                count=count,
+                page=page
+            )
+        except (AttributeError, TypeError):
+            # Fallback to regular search if search_gifs doesn't exist or fails
+            result = await asyncio.to_thread(
+                api.search,
+                query,
+                order=order_enum,
+                count=count,
+                page=page
+            )
+
         return self._parse_search_result(result)
 
     async def get_gif(self, gif_id: str) -> dict:
@@ -882,25 +921,41 @@ class SuperBrowserBot(fp.PoeBot):
             yield fp.PartialResponse(text=f"Error: {str(e)}")
 
     async def _handle_browse(self, args: list[str]) -> AsyncIterable[fp.PartialResponse]:
-        """Handle browse command."""
+        """
+        Handle browse command.
+
+        Usage: browse <tag> [page] [order]
+        - tag: The tag to search for
+        - page: Page number (default: 1)
+        - order: Sort order - latest, trending, top, top7, top28 (default: latest)
+        """
         if not args:
             yield fp.PartialResponse(text="Please specify a tag to browse. Example: `browse cats`")
             return
 
         tag = args[0]
-        page = int(args[1]) if len(args) > 1 and args[1].isdigit() else 1
-        count = 10
+        page = 1
+        order = "latest"  # Default to latest for fresh results
+        count = 20  # More results per page for infinite scroll
 
-        yield fp.PartialResponse(text=f"🔍 Searching for **{tag}** (page {page})...\n\n")
+        # Parse optional arguments
+        for arg in args[1:]:
+            if arg.isdigit():
+                page = int(arg)
+            elif arg.lower() in ["latest", "trending", "top", "top7", "top28", "new", "best"]:
+                order = arg.lower()
+
+        yield fp.PartialResponse(text=f"🔍 Searching for **{tag}** (page {page}, {order})...\n\n")
 
         try:
-            result = await redgifs_client.search(tag, page=page, count=count)
+            # Always fetch fresh results - no caching of browse listings
+            result = await redgifs_client.search(tag, page=page, count=count, order=order)
         except Exception as e:
             yield fp.PartialResponse(text=f"Error fetching from RedGifs: {str(e)}")
             return
 
-        for gif in result["gifs"]:
-            await cache_gif(gif)
+        # Note: We don't cache browse results - only individual GIF metadata
+        # when they are accessed via /media/{id} endpoint
 
         response_data = {
             "type": "browse_result",
@@ -908,6 +963,7 @@ class SuperBrowserBot(fp.PoeBot):
             "page": result["page"],
             "pages": result["pages"],
             "total": result["total"],
+            "order": order,
             "items": []
         }
 
@@ -974,9 +1030,20 @@ class SuperBrowserBot(fp.PoeBot):
 
 **Commands:**
 
-- `browse <tag>` - Browse GIFs by tag
-  - Example: `browse cats`
-  - Example: `browse funny 2` (page 2)
+- `browse <tag> [page] [order]` - Browse GIFs by tag
+  - `tag`: The tag to search for
+  - `page`: Page number (default: 1)
+  - `order`: Sort order (default: latest)
+    - `latest` - Most recent uploads
+    - `trending` - Currently popular
+    - `top` - All-time top rated
+    - `top7` - Top rated this week
+    - `top28` - Top rated this month
+  - Examples:
+    - `browse blonde` - Latest blonde content
+    - `browse amateur 2` - Page 2 of amateur
+    - `browse milf trending` - Trending milf content
+    - `browse asian 3 top7` - Page 3, top of the week
 
 - `item <gif_id>` - Get a specific item with caption
   - Example: `item abcxyz123`
@@ -984,8 +1051,9 @@ class SuperBrowserBot(fp.PoeBot):
 - `help` - Show this help message
 
 **Features:**
-- 🔒 Automated nudity censoring using AI detection (direct ONNX inference)
-- 📦 Cached and processed images served from `/media/{id}`
+- 🔒 Dual-model AI nudity censoring (320n + 640m)
+- 📦 Processed images served from `/media/{id}`
+- 🔄 Fresh results on every browse (no stale cache)
 
 **For Canvas Apps:**
 Responses are returned as JSON in code blocks for easy parsing.
