@@ -1,28 +1,38 @@
 # Super Browser - Railway Deployment
-# Uses Python 3.11 for better compatibility with ML libraries
-
 FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies (minimal, no X11 needed)
+# Install system dependencies required by OpenCV
+# These X11/graphics libs are needed even for "headless" OpenCV operations
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # OpenCV core dependencies
     libgl1-mesa-glx \
     libglib2.0-0 \
+    # X11 libraries (required by opencv-python even for non-GUI operations)
+    libxcb1 \
+    libx11-6 \
+    libxext6 \
+    libsm6 \
+    libxrender1 \
+    libfontconfig1 \
+    libice6 \
+    # Cleanup
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first for better caching
+# Copy requirements
 COPY requirements.txt .
 
-# Install Python dependencies with explicit headless OpenCV
-# 1. Install headless OpenCV first
-# 2. Install other dependencies, but prevent opencv-python from being installed
-RUN pip install --no-cache-dir opencv-python-headless>=4.8.0 && \
-    pip install --no-cache-dir -r requirements.txt && \
-    pip uninstall -y opencv-python 2>/dev/null || true
+# Install dependencies, then force headless OpenCV
+RUN pip install --no-cache-dir -r requirements.txt && \
+    pip uninstall -y opencv-python 2>/dev/null || true && \
+    pip install --no-cache-dir --force-reinstall opencv-python-headless>=4.8.0
 
 # Copy application code
 COPY main.py .
+
+# Create cache directories
+RUN mkdir -p media_cache
 
 # Expose port
 EXPOSE 8000
