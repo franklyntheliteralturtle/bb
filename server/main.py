@@ -10,6 +10,8 @@ import json
 import hashlib
 import asyncio
 import tempfile
+import subprocess
+import shutil
 from pathlib import Path
 from typing import AsyncIterable
 from contextlib import asynccontextmanager
@@ -138,9 +140,17 @@ DEFAULT_CENSOR_CLASSES = [
 CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
 CENSOR_CLASSES = [c.strip() for c in CENSOR_CLASSES if c.strip()]
 
+# Video processing configuration
+VIDEO_CACHE_DIR = Path(os.getenv("VIDEO_CACHE_DIR", "video_cache"))
+VIDEO_KEYFRAME_INTERVAL = int(os.getenv("VIDEO_KEYFRAME_INTERVAL", "30"))  # frames (1 sec at 30fps)
+VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.15"))  # 15% pixel diff
+VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "60"))  # Max video duration in seconds
+VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "30"))  # Target FPS for processing
+
 # Ensure directories exist
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
@@ -619,6 +629,548 @@ nudenet_censor = NudeNetCensor()
 
 
 # =============================================================================
+# Video Processor - Frame-by-frame with Smart Keyframes & Interpolation
+# =============================================================================
+
+class VideoProcessor:
+    """
+    Processes videos by detecting nudity on keyframes and interpolating
+    censor boxes smoothly between them.
+
+    Features:
+    - Smart keyframe detection (scene changes)
+    - Time-distributed keyframes as fallback
+    - Smooth box interpolation between keyframes
+    """
+
+    def __init__(self, censor: NudeNetCensor):
+        self.censor = censor
+        self.keyframe_interval = VIDEO_KEYFRAME_INTERVAL
+        self.scene_change_threshold = VIDEO_SCENE_CHANGE_THRESHOLD
+        self.target_fps = VIDEO_TARGET_FPS
+        self.max_duration = VIDEO_MAX_DURATION
+
+    async def process_video(self, video_bytes: bytes, quality: str = "sd") -> tuple[bytes, dict]:
+        """
+        Process a video with nudity censoring.
+
+        Args:
+            video_bytes: Raw video bytes
+            quality: Output quality ("sd" or "hd")
+
+        Returns:
+            Tuple of (processed_video_bytes, processing_stats)
+        """
+        stats = {
+            "total_frames": 0,
+            "keyframes_detected": 0,
+            "detections_total": 0,
+            "processing_time_seconds": 0,
+        }
+
+        import time
+        start_time = time.time()
+
+        # Create temporary directory for frame processing
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            input_video = temp_path / "input.mp4"
+            output_video = temp_path / "output.mp4"
+            frames_dir = temp_path / "frames"
+            processed_dir = temp_path / "processed"
+            audio_file = temp_path / "audio.aac"
+
+            frames_dir.mkdir()
+            processed_dir.mkdir()
+
+            # Write input video
+            await asyncio.to_thread(input_video.write_bytes, video_bytes)
+
+            # Get video info
+            video_info = await self._get_video_info(input_video)
+            fps = min(video_info.get("fps", 30), self.target_fps)
+            duration = min(video_info.get("duration", 10), self.max_duration)
+            has_audio = video_info.get("has_audio", False)
+
+            # Extract frames
+            await self._extract_frames(input_video, frames_dir, fps)
+
+            # Extract audio if present
+            if has_audio:
+                await self._extract_audio(input_video, audio_file)
+
+            # Get list of frames
+            frame_files = sorted(frames_dir.glob("*.png"))
+            stats["total_frames"] = len(frame_files)
+
+            if not frame_files:
+                raise ValueError("No frames extracted from video")
+
+            # Identify keyframes and run detection
+            keyframe_data = await self._process_keyframes(frame_files)
+            stats["keyframes_detected"] = len(keyframe_data)
+            stats["detections_total"] = sum(len(kf["detections"]) for kf in keyframe_data.values())
+
+            # Process all frames with interpolation
+            await self._apply_censorship_with_interpolation(
+                frame_files,
+                keyframe_data,
+                processed_dir
+            )
+
+            # Encode output video
+            await self._encode_video(
+                processed_dir,
+                output_video,
+                fps,
+                audio_file if has_audio and audio_file.exists() else None
+            )
+
+            # Read output
+            output_bytes = await asyncio.to_thread(output_video.read_bytes)
+
+            stats["processing_time_seconds"] = round(time.time() - start_time, 2)
+
+            return output_bytes, stats
+
+    async def _get_video_info(self, video_path: Path) -> dict:
+        """Get video metadata using ffprobe."""
+        cmd = [
+            "ffprobe",
+            "-v", "quiet",
+            "-print_format", "json",
+            "-show_format",
+            "-show_streams",
+            str(video_path)
+        ]
+
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            print(f"ffprobe error: {result.stderr}")
+            return {"fps": 30, "duration": 10, "has_audio": False}
+
+        try:
+            data = json.loads(result.stdout)
+
+            # Find video stream
+            fps = 30.0
+            has_audio = False
+
+            for stream in data.get("streams", []):
+                if stream.get("codec_type") == "video":
+                    # Parse frame rate (could be "30/1" or "29.97")
+                    fps_str = stream.get("r_frame_rate", "30/1")
+                    if "/" in fps_str:
+                        num, den = fps_str.split("/")
+                        fps = float(num) / float(den) if float(den) != 0 else 30
+                    else:
+                        fps = float(fps_str)
+                elif stream.get("codec_type") == "audio":
+                    has_audio = True
+
+            duration = float(data.get("format", {}).get("duration", 10))
+
+            return {"fps": fps, "duration": duration, "has_audio": has_audio}
+        except (json.JSONDecodeError, KeyError, ValueError) as e:
+            print(f"Error parsing video info: {e}")
+            return {"fps": 30, "duration": 10, "has_audio": False}
+
+    async def _extract_frames(self, video_path: Path, output_dir: Path, fps: float):
+        """Extract frames from video using ffmpeg."""
+        cmd = [
+            "ffmpeg",
+            "-i", str(video_path),
+            "-vf", f"fps={fps}",
+            "-q:v", "2",  # High quality PNG
+            str(output_dir / "frame_%06d.png"),
+            "-y",
+            "-loglevel", "error"
+        ]
+
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Frame extraction failed: {result.stderr}")
+
+    async def _extract_audio(self, video_path: Path, audio_path: Path):
+        """Extract audio track from video."""
+        cmd = [
+            "ffmpeg",
+            "-i", str(video_path),
+            "-vn",  # No video
+            "-acodec", "aac",
+            "-b:a", "128k",
+            str(audio_path),
+            "-y",
+            "-loglevel", "error"
+        ]
+
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True
+        )
+
+        # Audio extraction can fail if no audio - that's OK
+        if result.returncode != 0:
+            print(f"Audio extraction skipped: {result.stderr}")
+
+    async def _process_keyframes(self, frame_files: list[Path]) -> dict[int, dict]:
+        """
+        Identify keyframes and run detection on them.
+
+        Returns dict mapping frame index to detection data.
+        """
+        keyframe_data = {}
+        prev_frame_array = None
+        last_keyframe_idx = -self.keyframe_interval  # Force first frame to be keyframe
+
+        for idx, frame_path in enumerate(frame_files):
+            # Load frame for comparison
+            frame_bytes = await asyncio.to_thread(frame_path.read_bytes)
+            frame_img = Image.open(io.BytesIO(frame_bytes))
+            frame_array = self._get_comparison_array(frame_img)
+
+            # Determine if this is a keyframe
+            is_keyframe = False
+
+            # Always make first frame a keyframe
+            if idx == 0:
+                is_keyframe = True
+            # Time-distributed keyframe (fallback interval)
+            elif idx - last_keyframe_idx >= self.keyframe_interval:
+                is_keyframe = True
+            # Scene change detection
+            elif prev_frame_array is not None:
+                diff = self._frame_difference(prev_frame_array, frame_array)
+                if diff > self.scene_change_threshold:
+                    is_keyframe = True
+                    print(f"Scene change detected at frame {idx}, diff={diff:.3f}")
+
+            if is_keyframe:
+                # Run detection on this keyframe
+                detections = await self._detect_frame(frame_bytes)
+                keyframe_data[idx] = {
+                    "detections": detections,
+                    "boxes": self._extract_censor_boxes(detections)
+                }
+                last_keyframe_idx = idx
+
+            prev_frame_array = frame_array
+
+        return keyframe_data
+
+    def _get_comparison_array(self, image: Image.Image) -> np.ndarray:
+        """Convert image to small grayscale array for fast comparison."""
+        # Downsample to 64x64 grayscale for fast comparison
+        small = image.resize((64, 64), Image.Resampling.BILINEAR).convert('L')
+        return np.array(small, dtype=np.float32)
+
+    def _frame_difference(self, arr1: np.ndarray, arr2: np.ndarray) -> float:
+        """Calculate normalized difference between two frame arrays."""
+        diff = np.abs(arr1 - arr2)
+        return float(np.mean(diff) / 255.0)
+
+    async def _detect_frame(self, frame_bytes: bytes) -> list[dict]:
+        """Run nudity detection on a single frame."""
+        # Use the dual-model detection
+        detections_320n, detections_640m = await asyncio.gather(
+            self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD),
+            self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
+        )
+
+        # Tag and merge
+        for d in detections_320n:
+            d["model"] = "320n"
+        for d in detections_640m:
+            d["model"] = "640m"
+
+        all_detections = detections_320n + detections_640m
+        return self.censor._merge_detections(all_detections)
+
+    def _extract_censor_boxes(self, detections: list[dict]) -> list[dict]:
+        """Extract boxes that need censoring."""
+        return [
+            {
+                "class": d["class"],
+                "box": d["box"],
+                "score": d["score"]
+            }
+            for d in detections
+            if d["class"] in CENSOR_CLASSES
+        ]
+
+    async def _apply_censorship_with_interpolation(
+        self,
+        frame_files: list[Path],
+        keyframe_data: dict[int, dict],
+        output_dir: Path
+    ):
+        """Apply censorship to all frames with smooth box interpolation."""
+
+        if not keyframe_data:
+            # No keyframes = no detections, just copy frames
+            for idx, frame_path in enumerate(frame_files):
+                shutil.copy(frame_path, output_dir / f"frame_{idx:06d}.png")
+            return
+
+        # Get sorted keyframe indices
+        keyframe_indices = sorted(keyframe_data.keys())
+
+        # Process frames in batches for efficiency
+        batch_size = 10
+        frame_batches = [
+            frame_files[i:i + batch_size]
+            for i in range(0, len(frame_files), batch_size)
+        ]
+
+        for batch_start_idx, batch in enumerate(frame_batches):
+            tasks = []
+            for local_idx, frame_path in enumerate(batch):
+                frame_idx = batch_start_idx * batch_size + local_idx
+                output_path = output_dir / f"frame_{frame_idx:06d}.png"
+
+                # Get interpolated boxes for this frame
+                boxes = self._get_interpolated_boxes(
+                    frame_idx,
+                    keyframe_indices,
+                    keyframe_data
+                )
+
+                tasks.append(
+                    self._process_single_frame(frame_path, output_path, boxes)
+                )
+
+            await asyncio.gather(*tasks)
+
+    def _get_interpolated_boxes(
+        self,
+        frame_idx: int,
+        keyframe_indices: list[int],
+        keyframe_data: dict[int, dict]
+    ) -> list[list[int]]:
+        """
+        Get interpolated censor boxes for a specific frame.
+        Smoothly interpolates between keyframes.
+        """
+        # Find surrounding keyframes
+        prev_kf_idx = None
+        next_kf_idx = None
+
+        for kf_idx in keyframe_indices:
+            if kf_idx <= frame_idx:
+                prev_kf_idx = kf_idx
+            if kf_idx >= frame_idx and next_kf_idx is None:
+                next_kf_idx = kf_idx
+                break
+
+        # If we're exactly on a keyframe, use its boxes directly
+        if frame_idx in keyframe_data:
+            return [b["box"] for b in keyframe_data[frame_idx]["boxes"]]
+
+        # If no previous keyframe, use next (shouldn't happen with frame 0 as keyframe)
+        if prev_kf_idx is None:
+            if next_kf_idx is not None:
+                return [b["box"] for b in keyframe_data[next_kf_idx]["boxes"]]
+            return []
+
+        # If no next keyframe, use previous
+        if next_kf_idx is None:
+            return [b["box"] for b in keyframe_data[prev_kf_idx]["boxes"]]
+
+        # Interpolate between prev and next keyframes
+        prev_boxes = keyframe_data[prev_kf_idx]["boxes"]
+        next_boxes = keyframe_data[next_kf_idx]["boxes"]
+
+        # Calculate interpolation factor (0 = prev, 1 = next)
+        if next_kf_idx == prev_kf_idx:
+            t = 0
+        else:
+            t = (frame_idx - prev_kf_idx) / (next_kf_idx - prev_kf_idx)
+
+        # Match boxes between keyframes and interpolate
+        return self._interpolate_box_sets(prev_boxes, next_boxes, t)
+
+    def _interpolate_box_sets(
+        self,
+        prev_boxes: list[dict],
+        next_boxes: list[dict],
+        t: float
+    ) -> list[list[int]]:
+        """
+        Interpolate between two sets of boxes.
+        Matches boxes by class and IoU, then interpolates positions.
+        """
+        result = []
+        used_next = set()
+
+        # For each box in prev, find best match in next
+        for prev_box in prev_boxes:
+            best_match = None
+            best_iou = 0.3  # Minimum IoU to consider a match
+
+            for idx, next_box in enumerate(next_boxes):
+                if idx in used_next:
+                    continue
+                if prev_box["class"] != next_box["class"]:
+                    continue
+
+                iou = self._calculate_iou(prev_box["box"], next_box["box"])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_match = idx
+
+            if best_match is not None:
+                # Interpolate between matched boxes
+                used_next.add(best_match)
+                interpolated = self._interpolate_single_box(
+                    prev_box["box"],
+                    next_boxes[best_match]["box"],
+                    t
+                )
+                result.append(interpolated)
+            else:
+                # No match - box is disappearing, keep it until halfway
+                if t < 0.5:
+                    result.append(prev_box["box"])
+
+        # Add unmatched next boxes (appearing boxes) after halfway
+        if t >= 0.5:
+            for idx, next_box in enumerate(next_boxes):
+                if idx not in used_next:
+                    result.append(next_box["box"])
+
+        return result
+
+    def _interpolate_single_box(
+        self,
+        box1: list[int],
+        box2: list[int],
+        t: float
+    ) -> list[int]:
+        """Linearly interpolate between two boxes."""
+        x1_a, y1_a, w_a, h_a = box1
+        x1_b, y1_b, w_b, h_b = box2
+
+        return [
+            int(x1_a + (x1_b - x1_a) * t),
+            int(y1_a + (y1_b - y1_a) * t),
+            int(w_a + (w_b - w_a) * t),
+            int(h_a + (h_b - h_a) * t),
+        ]
+
+    def _calculate_iou(self, box1: list[int], box2: list[int]) -> float:
+        """Calculate Intersection over Union between two boxes."""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+
+        box1_x2, box1_y2 = x1 + w1, y1 + h1
+        box2_x2, box2_y2 = x2 + w2, y2 + h2
+
+        inter_x1 = max(x1, x2)
+        inter_y1 = max(y1, y2)
+        inter_x2 = min(box1_x2, box2_x2)
+        inter_y2 = min(box1_y2, box2_y2)
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - inter_area
+
+        if union_area == 0:
+            return 0
+
+        return inter_area / union_area
+
+    async def _process_single_frame(
+        self,
+        input_path: Path,
+        output_path: Path,
+        boxes: list[list[int]]
+    ):
+        """Apply censor boxes to a single frame and save."""
+        frame_bytes = await asyncio.to_thread(input_path.read_bytes)
+
+        if not boxes:
+            # No censoring needed, just copy
+            await asyncio.to_thread(shutil.copy, input_path, output_path)
+            return
+
+        # Apply black boxes
+        img = Image.open(io.BytesIO(frame_bytes))
+
+        # Convert to RGB if necessary
+        if img.mode in ('RGBA', 'P'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        draw = ImageDraw.Draw(img)
+
+        for box in boxes:
+            x, y, w, h = box
+            draw.rectangle([x, y, x + w, y + h], fill=(0, 0, 0))
+
+        # Save processed frame
+        await asyncio.to_thread(img.save, output_path, format='PNG')
+
+    async def _encode_video(
+        self,
+        frames_dir: Path,
+        output_path: Path,
+        fps: float,
+        audio_path: Path | None = None
+    ):
+        """Encode processed frames back into a video."""
+        cmd = [
+            "ffmpeg",
+            "-framerate", str(fps),
+            "-i", str(frames_dir / "frame_%06d.png"),
+        ]
+
+        # Add audio if available
+        if audio_path and audio_path.exists():
+            cmd.extend(["-i", str(audio_path)])
+
+        cmd.extend([
+            "-c:v", "libx264",
+            "-preset", "fast",
+            "-crf", "23",  # Good quality
+            "-pix_fmt", "yuv420p",  # Compatibility
+        ])
+
+        # Add audio codec if we have audio
+        if audio_path and audio_path.exists():
+            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
+
+        cmd.extend([
+            "-movflags", "+faststart",  # Web optimization
+            str(output_path),
+            "-y",
+            "-loglevel", "error"
+        ])
+
+        result = await asyncio.to_thread(
+            subprocess.run, cmd, capture_output=True, text=True
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(f"Video encoding failed: {result.stderr}")
+
+
+# Global video processor instance
+video_processor: VideoProcessor | None = None
+
+
+# =============================================================================
 # Database Setup
 # =============================================================================
 
@@ -680,6 +1232,15 @@ async def init_db():
                 processed_path TEXT,
                 original_type TEXT,
                 detections TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS processed_videos (
+                gif_id TEXT PRIMARY KEY,
+                processed_path TEXT,
+                quality TEXT,
+                stats TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -756,6 +1317,40 @@ class RedGifsClient:
                 pass
 
         return media_bytes, content_type
+
+    async def download_video(self, gif_id: str, quality: str = "sd") -> tuple[bytes, str]:
+        """
+        Download video for a GIF. Returns (bytes, content_type).
+
+        Args:
+            gif_id: The GIF ID to download
+            quality: "sd" or "hd"
+        """
+        api = await self.get_api()
+        gif = await asyncio.to_thread(api.get_gif, gif_id)
+
+        # Choose URL based on quality preference
+        if quality == "hd":
+            url = gif.urls.hd or gif.urls.sd
+        else:
+            url = gif.urls.sd or gif.urls.hd
+
+        if not url:
+            raise Exception(f"No video URL available for {gif_id}")
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
+            tmp_path = tmp.name
+
+        try:
+            await asyncio.to_thread(api.download, url, tmp_path)
+            video_bytes = await asyncio.to_thread(Path(tmp_path).read_bytes)
+        finally:
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
+
+        return video_bytes, "video/mp4"
 
     def _parse_search_result(self, result) -> dict:
         return {
@@ -984,6 +1579,51 @@ async def cache_processed_media(gif_id: str, processed_bytes: bytes, detections:
     return str(filepath)
 
 
+async def get_processed_video_path(gif_id: str, quality: str = "sd") -> str | None:
+    """Get path to cached processed video if it exists."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT processed_path FROM processed_videos WHERE gif_id = ? AND quality = ?",
+            (gif_id, quality)
+        )
+        row = await cursor.fetchone()
+        if row and Path(row[0]).exists():
+            return row[0]
+    return None
+
+
+async def cache_processed_video(
+    gif_id: str,
+    processed_bytes: bytes,
+    quality: str,
+    stats: dict
+) -> str:
+    """Cache a processed video and return its path."""
+    filename = f"{hashlib.md5(f'{gif_id}_{quality}'.encode()).hexdigest()}.mp4"
+    filepath = VIDEO_CACHE_DIR / filename
+    await asyncio.to_thread(filepath.write_bytes, processed_bytes)
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO processed_videos (gif_id, processed_path, quality, stats)
+            VALUES (?, ?, ?, ?)
+        """, (gif_id, str(filepath), quality, json.dumps(stats)))
+        await db.commit()
+    return str(filepath)
+
+
+async def get_video_processing_stats(gif_id: str, quality: str = "sd") -> dict | None:
+    """Get processing stats for a cached video."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT stats FROM processed_videos WHERE gif_id = ? AND quality = ?",
+            (gif_id, quality)
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return json.loads(row[0])
+    return None
+
+
 # =============================================================================
 # Poe Bot Implementation
 # =============================================================================
@@ -1081,6 +1721,7 @@ class SuperBrowserBot(fp.PoeBot):
                     "sd_url": gif["sd_url"],
                     "web_url": gif["web_url"],
                     "media_url": media_url,
+                    "video_url": f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None,
                     "username": gif.get("username"),
                     "tags": gif.get("tags", []),
                 })
@@ -1117,6 +1758,7 @@ class SuperBrowserBot(fp.PoeBot):
                     "sd_url": gif["sd_url"],
                     "web_url": gif["web_url"],
                     "media_url": media_url,
+                    "video_url": f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None,
                     "username": gif.get("username"),
                     "tags": gif.get("tags", []),
                 })
@@ -1187,6 +1829,7 @@ class SuperBrowserBot(fp.PoeBot):
             "sd_url": gif_data.get("sd_url"),
             "web_url": gif_data.get("web_url"),
             "media_url": media_url,
+            "video_url": f"{SERVER_URL}/video/{gif_id}" if SERVER_URL else None,
             "caption": caption,
             "username": gif_data.get("username"),
             "tags": gif_data.get("tags", "").split(",") if isinstance(gif_data.get("tags"), str) else gif_data.get("tags", []),
@@ -1232,11 +1875,17 @@ class SuperBrowserBot(fp.PoeBot):
 **Features:**
 - 🔒 Dual-model AI nudity censoring (320n + 640m)
 - 📦 Processed images served from `/media/{id}`
+- 🎬 **NEW: Video censoring** served from `/video/{id}`
+  - Smart keyframe detection (scene changes)
+  - Smooth censor box interpolation between keyframes
+  - Audio preserved
+  - First request takes 10-60s to process, then cached
 - 🏷️ Local tag filtering (more reliable than API search)
 - 💾 All content cached for instant tag-based browsing
 
 **For Canvas Apps:**
 Responses are returned as JSON in code blocks for easy parsing.
+Each item includes `media_url` (censored thumbnail) and `video_url` (censored video).
 """
 
     async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
@@ -1248,7 +1897,8 @@ Responses are returned as JSON in code blocks for easy parsing.
             "• `browse` - Get trending content (builds cache)\n"
             "• `tags` - See available tags with counts\n"
             "• `browse <tag>` - Filter cached content by tag\n\n"
-            "🔒 All images are processed with automated nudity censoring.\n\n"
+            "🔒 All images AND videos are processed with automated nudity censoring.\n"
+            "🎬 Video censoring uses smart keyframe detection with smooth interpolation.\n\n"
             "Type `help` for more commands.",
         )
 
@@ -1279,10 +1929,14 @@ original_lifespan = app.router.lifespan_context
 
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
+    global video_processor
     await init_db()
     print("Pre-loading NudeNet ONNX model...")
     await nudenet_censor.load()
     print("NudeNet model ready!")
+    # Initialize video processor
+    video_processor = VideoProcessor(nudenet_censor)
+    print("Video processor initialized!")
     async with original_lifespan(app):
         yield
     await redgifs_client.close()
@@ -1312,6 +1966,15 @@ async def root():
             "models": ["NudeNet 320n", "NudeNet 640m"],
             "censor_threshold": CENSOR_THRESHOLD,
             "local_tag_filtering": True,
+            "video_processing": True,
+            "video_features": {
+                "smart_keyframes": True,
+                "scene_change_detection": True,
+                "smooth_box_interpolation": True,
+                "keyframe_interval_frames": VIDEO_KEYFRAME_INTERVAL,
+                "scene_change_threshold": VIDEO_SCENE_CHANGE_THRESHOLD,
+                "max_duration_seconds": VIDEO_MAX_DURATION,
+            },
         },
         "cache_stats": {
             "total_tags": total_tags,
@@ -1320,7 +1983,9 @@ async def root():
         "endpoints": {
             "/tags": "GET - List all cached tags with counts",
             "/browse/tag/{tag}": "GET - Get cached GIFs by tag",
-            "/media/{gif_id}": "GET - Get processed (censored) media",
+            "/media/{gif_id}": "GET - Get processed (censored) thumbnail image",
+            "/video/{gif_id}": "GET - Get processed (censored) video (query: quality=sd|hd)",
+            "/video/{gif_id}/status": "GET - Check video processing status",
         }
     }
 
@@ -1376,14 +2041,124 @@ async def browse_by_tag(tag: str, page: int = 1, count: int = 20):
     """Get cached GIFs by tag."""
     result = await get_gifs_by_tag(tag, page=page, count=count)
 
-    # Add media_url to each gif
+    # Add media_url and video_url to each gif
     for gif in result["gifs"]:
         gif["media_url"] = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
+        gif["video_url"] = f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None
 
     return {
         "source": "cache",
         "tag": tag,
         **result
+    }
+
+
+@app.get("/video/{gif_id}")
+async def get_processed_video(gif_id: str, quality: str = "sd"):
+    """
+    Serve processed video with nudity censored.
+
+    This endpoint downloads the video, processes it frame-by-frame with
+    smart keyframe detection and smooth box interpolation, then serves
+    the censored result.
+
+    Query params:
+        quality: "sd" (default) or "hd"
+
+    Note: First request for a video will take 10-60 seconds to process.
+    Subsequent requests are served from cache.
+    """
+    global video_processor
+
+    if video_processor is None:
+        return Response(
+            content="Video processor not initialized",
+            status_code=503
+        )
+
+    # Validate quality param
+    if quality not in ("sd", "hd"):
+        quality = "sd"
+
+    # Check cache first
+    cached_path = await get_processed_video_path(gif_id, quality)
+    if cached_path:
+        return FileResponse(
+            cached_path,
+            media_type="video/mp4",
+            headers={
+                "X-Cache": "HIT",
+                "X-Processing-Time": "0"
+            }
+        )
+
+    # Download the video
+    try:
+        print(f"Downloading video {gif_id} ({quality})...")
+        video_bytes, _ = await redgifs_client.download_video(gif_id, quality)
+        print(f"Downloaded {len(video_bytes) / 1024 / 1024:.1f} MB")
+    except Exception as e:
+        return Response(
+            content=f"Error downloading video: {e}",
+            status_code=404
+        )
+
+    # Process the video
+    try:
+        print(f"Processing video {gif_id}...")
+        processed_bytes, stats = await video_processor.process_video(video_bytes, quality)
+        print(f"Video processed: {stats}")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return Response(
+            content=f"Error processing video: {e}",
+            status_code=500
+        )
+
+    # Cache the result
+    filepath = await cache_processed_video(gif_id, processed_bytes, quality, stats)
+
+    return FileResponse(
+        filepath,
+        media_type="video/mp4",
+        headers={
+            "X-Cache": "MISS",
+            "X-Processing-Time": str(stats.get("processing_time_seconds", 0)),
+            "X-Keyframes": str(stats.get("keyframes_detected", 0)),
+            "X-Total-Frames": str(stats.get("total_frames", 0)),
+        }
+    )
+
+
+@app.get("/video/{gif_id}/status")
+async def get_video_status(gif_id: str, quality: str = "sd"):
+    """
+    Check if a processed video exists in cache and get its stats.
+    Useful for checking status before requesting a potentially long processing job.
+    """
+    if quality not in ("sd", "hd"):
+        quality = "sd"
+
+    cached_path = await get_processed_video_path(gif_id, quality)
+
+    if cached_path:
+        stats = await get_video_processing_stats(gif_id, quality)
+        return {
+            "gif_id": gif_id,
+            "quality": quality,
+            "status": "ready",
+            "cached": True,
+            "stats": stats,
+            "video_url": f"{SERVER_URL}/video/{gif_id}?quality={quality}" if SERVER_URL else None
+        }
+
+    return {
+        "gif_id": gif_id,
+        "quality": quality,
+        "status": "not_processed",
+        "cached": False,
+        "message": "Video has not been processed yet. Request /video/{gif_id} to trigger processing."
     }
 
 
