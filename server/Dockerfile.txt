@@ -24,9 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY requirements.txt .
 
 # Install dependencies, then force headless OpenCV
-RUN pip install --no-cache-dir -r requirements.txt && \
-    pip uninstall -y opencv-python 2>/dev/null || true && \
-    pip install --no-cache-dir --force-reinstall opencv-python-headless>=4.8.0
+RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY main.py .
