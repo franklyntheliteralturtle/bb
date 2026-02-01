@@ -2,13 +2,10 @@
 nudenet>=3.4.0
 onnxruntime>=1.18.0
 
-# NOTE: opencv-python-headless is installed separately in Dockerfile
-# to prevent opencv-python (GUI version) from being installed as a dependency
-
 # Poe Protocol
 fastapi-poe==0.0.48
 
-# Web framework (included by fastapi-poe, but explicit for clarity)
+# Web framework
 fastapi==0.109.2
 uvicorn[standard]==0.27.1
 

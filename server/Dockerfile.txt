@@ -3,13 +3,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies required by OpenCV
-# These X11/graphics libs are needed even for "headless" OpenCV operations
+# Install ALL system dependencies required by OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # OpenCV core dependencies
     libgl1-mesa-glx \
     libglib2.0-0 \
-    # X11 libraries (required by opencv-python even for non-GUI operations)
     libxcb1 \
     libx11-6 \
     libxext6 \
@@ -17,13 +14,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender1 \
     libfontconfig1 \
     libice6 \
-    # Cleanup
+    libgtk-3-0 \
+    libavcodec-dev \
+    libavformat-dev \
+    libswscale-dev \
+    libv4l-dev \
+    libxvidcore-dev \
+    libx264-dev \
+    libjpeg-dev \
+    libpng-dev \
+    libtiff-dev \
+    libatlas-base-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
+# Copy and install requirements
 COPY requirements.txt .
-
-# Install dependencies, then force headless OpenCV
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
