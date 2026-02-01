@@ -1957,6 +1957,24 @@ async def root():
     total_tags_result = await get_available_tags(limit=10000)
     total_tags = len(total_tags_result)
 
+    # Check ffmpeg availability
+    ffmpeg_available = False
+    ffmpeg_version = None
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            ffmpeg_available = True
+            # Extract version from first line
+            first_line = result.stdout.split('\n')[0] if result.stdout else ""
+            ffmpeg_version = first_line
+    except Exception:
+        pass
+
     return {
         "status": "ok",
         "service": "Super Browser Bot",
@@ -1966,7 +1984,9 @@ async def root():
             "models": ["NudeNet 320n", "NudeNet 640m"],
             "censor_threshold": CENSOR_THRESHOLD,
             "local_tag_filtering": True,
-            "video_processing": True,
+            "video_processing": ffmpeg_available,
+            "ffmpeg_available": ffmpeg_available,
+            "ffmpeg_version": ffmpeg_version,
             "video_features": {
                 "smart_keyframes": True,
                 "scene_change_detection": True,
@@ -1974,7 +1994,7 @@ async def root():
                 "keyframe_interval_frames": VIDEO_KEYFRAME_INTERVAL,
                 "scene_change_threshold": VIDEO_SCENE_CHANGE_THRESHOLD,
                 "max_duration_seconds": VIDEO_MAX_DURATION,
-            },
+            } if ffmpeg_available else None,
         },
         "cache_stats": {
             "total_tags": total_tags,
@@ -1984,7 +2004,7 @@ async def root():
             "/tags": "GET - List all cached tags with counts",
             "/browse/tag/{tag}": "GET - Get cached GIFs by tag",
             "/media/{gif_id}": "GET - Get processed (censored) thumbnail image",
-            "/video/{gif_id}": "GET - Get processed (censored) video (query: quality=sd|hd)",
+            "/video/{gif_id}": "GET - Get processed (censored) video (query: quality=sd|hd)" if ffmpeg_available else "UNAVAILABLE - ffmpeg not installed",
             "/video/{gif_id}/status": "GET - Check video processing status",
         }
     }
@@ -2053,6 +2073,34 @@ async def browse_by_tag(tag: str, page: int = 1, count: int = 20):
     }
 
 
+def check_ffmpeg_available() -> tuple[bool, str]:
+    """Check if ffmpeg and ffprobe are available."""
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode != 0:
+            return False, "ffmpeg not working"
+
+        result = subprocess.run(
+            ["ffprobe", "-version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode != 0:
+            return False, "ffprobe not working"
+
+        return True, "ffmpeg available"
+    except FileNotFoundError:
+        return False, "ffmpeg/ffprobe not installed. Video processing requires ffmpeg."
+    except Exception as e:
+        return False, f"ffmpeg check failed: {e}"
+
+
 @app.get("/video/{gif_id}")
 async def get_processed_video(gif_id: str, quality: str = "sd"):
     """
@@ -2069,6 +2117,14 @@ async def get_processed_video(gif_id: str, quality: str = "sd"):
     Subsequent requests are served from cache.
     """
     global video_processor
+
+    # Check ffmpeg availability
+    ffmpeg_ok, ffmpeg_msg = check_ffmpeg_available()
+    if not ffmpeg_ok:
+        return Response(
+            content=f"Video processing unavailable: {ffmpeg_msg}",
+            status_code=503
+        )
 
     if video_processor is None:
         return Response(
