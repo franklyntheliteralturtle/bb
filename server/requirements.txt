@@ -1,15 +1,9 @@
-# =============================================================================
-# IMPORTANT: opencv-python-headless MUST be listed before nudenet
-# to prevent the GUI version (opencv-python) from being installed.
-# The GUI version requires X11 libraries not available on headless servers.
-# =============================================================================
-
-# OpenCV headless (required by NudeNet, for server environments without display)
-opencv-python-headless>=4.8.0
-
 # Nudity detection and censoring
 nudenet>=3.4.0
 onnxruntime>=1.18.0
+
+# NOTE: opencv-python-headless is installed separately in Dockerfile
+# to prevent opencv-python (GUI version) from being installed as a dependency
 
 # Poe Protocol
 fastapi-poe==0.0.48
