@@ -142,10 +142,14 @@ CENSOR_CLASSES = [c.strip() for c in CENSOR_CLASSES if c.strip()]
 
 # Video processing configuration
 VIDEO_CACHE_DIR = Path(os.getenv("VIDEO_CACHE_DIR", "video_cache"))
-VIDEO_KEYFRAME_INTERVAL = int(os.getenv("VIDEO_KEYFRAME_INTERVAL", "30"))  # frames (1 sec at 30fps)
+VIDEO_KEYFRAME_INTERVAL_SECONDS = float(os.getenv("VIDEO_KEYFRAME_INTERVAL_SECONDS", "1.0"))  # seconds between forced keyframes
 VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.15"))  # 15% pixel diff
 VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "60"))  # Max video duration in seconds
-VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "30"))  # Target FPS for processing
+VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "15"))  # Target FPS for processing (lower = faster)
+VIDEO_USE_DUAL_MODELS = os.getenv("VIDEO_USE_DUAL_MODELS", "false").lower() == "true"  # Use both 320n and 640m
+VIDEO_PRIMARY_MODEL = os.getenv("VIDEO_PRIMARY_MODEL", "320n")  # Which model to use if not dual: "320n" or "640m"
+VIDEO_BATCH_SIZE = int(os.getenv("VIDEO_BATCH_SIZE", "20"))  # Frames to process in parallel batches
+VIDEO_VERBOSE_LOGGING = os.getenv("VIDEO_VERBOSE_LOGGING", "true").lower() == "true"  # Detailed logging
 
 # Ensure directories exist
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -641,14 +645,24 @@ class VideoProcessor:
     - Smart keyframe detection (scene changes)
     - Time-distributed keyframes as fallback
     - Smooth box interpolation between keyframes
+    - Configurable single or dual model detection
     """
 
     def __init__(self, censor: NudeNetCensor):
         self.censor = censor
-        self.keyframe_interval = VIDEO_KEYFRAME_INTERVAL
+        self.keyframe_interval_seconds = VIDEO_KEYFRAME_INTERVAL_SECONDS
         self.scene_change_threshold = VIDEO_SCENE_CHANGE_THRESHOLD
         self.target_fps = VIDEO_TARGET_FPS
         self.max_duration = VIDEO_MAX_DURATION
+        self.use_dual_models = VIDEO_USE_DUAL_MODELS
+        self.primary_model = VIDEO_PRIMARY_MODEL
+        self.batch_size = VIDEO_BATCH_SIZE
+        self.verbose = VIDEO_VERBOSE_LOGGING
+
+    def _log(self, msg: str, force: bool = False):
+        """Log a message if verbose logging is enabled."""
+        if self.verbose or force:
+            print(f"[VideoProcessor] {msg}")
 
     async def process_video(self, video_bytes: bytes, quality: str = "sd") -> tuple[bytes, dict]:
         """
@@ -661,15 +675,30 @@ class VideoProcessor:
         Returns:
             Tuple of (processed_video_bytes, processing_stats)
         """
+        import time
+
         stats = {
             "total_frames": 0,
             "keyframes_detected": 0,
+            "scene_changes_detected": 0,
+            "time_based_keyframes": 0,
             "detections_total": 0,
             "processing_time_seconds": 0,
+            "timing_breakdown": {},
+            "config": {
+                "target_fps": self.target_fps,
+                "keyframe_interval_seconds": self.keyframe_interval_seconds,
+                "scene_change_threshold": self.scene_change_threshold,
+                "use_dual_models": self.use_dual_models,
+                "primary_model": self.primary_model if not self.use_dual_models else "both",
+                "batch_size": self.batch_size,
+            }
         }
 
-        import time
-        start_time = time.time()
+        total_start = time.time()
+        self._log(f"=== Starting video processing ({len(video_bytes) / 1024 / 1024:.1f} MB) ===", force=True)
+        self._log(f"Config: fps={self.target_fps}, keyframe_interval={self.keyframe_interval_seconds}s, "
+                  f"scene_threshold={self.scene_change_threshold}, dual_models={self.use_dual_models}")
 
         # Create temporary directory for frame processing
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -687,49 +716,81 @@ class VideoProcessor:
             await asyncio.to_thread(input_video.write_bytes, video_bytes)
 
             # Get video info
+            step_start = time.time()
             video_info = await self._get_video_info(input_video)
-            fps = min(video_info.get("fps", 30), self.target_fps)
+            original_fps = video_info.get("fps", 30)
+            fps = min(original_fps, self.target_fps)
             duration = min(video_info.get("duration", 10), self.max_duration)
             has_audio = video_info.get("has_audio", False)
+            stats["timing_breakdown"]["get_video_info"] = round(time.time() - step_start, 2)
+            self._log(f"Video info: {duration:.1f}s duration, {original_fps:.1f} original fps -> {fps} target fps, audio={has_audio}")
+
+            # Calculate keyframe interval in frames
+            keyframe_interval_frames = max(1, int(fps * self.keyframe_interval_seconds))
+            self._log(f"Keyframe interval: every {keyframe_interval_frames} frames ({self.keyframe_interval_seconds}s)")
 
             # Extract frames
+            step_start = time.time()
             await self._extract_frames(input_video, frames_dir, fps)
+            stats["timing_breakdown"]["extract_frames"] = round(time.time() - step_start, 2)
 
             # Extract audio if present
             if has_audio:
+                step_start = time.time()
                 await self._extract_audio(input_video, audio_file)
+                stats["timing_breakdown"]["extract_audio"] = round(time.time() - step_start, 2)
 
             # Get list of frames
             frame_files = sorted(frames_dir.glob("*.png"))
             stats["total_frames"] = len(frame_files)
+            self._log(f"Extracted {len(frame_files)} frames in {stats['timing_breakdown']['extract_frames']:.1f}s")
 
             if not frame_files:
                 raise ValueError("No frames extracted from video")
 
             # Identify keyframes and run detection
-            keyframe_data = await self._process_keyframes(frame_files)
+            step_start = time.time()
+            keyframe_data, keyframe_stats = await self._process_keyframes(frame_files, keyframe_interval_frames)
+            stats["timing_breakdown"]["process_keyframes"] = round(time.time() - step_start, 2)
             stats["keyframes_detected"] = len(keyframe_data)
+            stats["scene_changes_detected"] = keyframe_stats.get("scene_changes", 0)
+            stats["time_based_keyframes"] = keyframe_stats.get("time_based", 0)
             stats["detections_total"] = sum(len(kf["detections"]) for kf in keyframe_data.values())
 
+            self._log(f"Keyframes: {len(keyframe_data)} total ({stats['scene_changes_detected']} scene changes, "
+                      f"{stats['time_based_keyframes']} time-based) in {stats['timing_breakdown']['process_keyframes']:.1f}s", force=True)
+            self._log(f"Total detections across keyframes: {stats['detections_total']}")
+
             # Process all frames with interpolation
+            step_start = time.time()
             await self._apply_censorship_with_interpolation(
                 frame_files,
                 keyframe_data,
                 processed_dir
             )
+            stats["timing_breakdown"]["apply_censorship"] = round(time.time() - step_start, 2)
+            self._log(f"Applied censorship to {len(frame_files)} frames in {stats['timing_breakdown']['apply_censorship']:.1f}s")
 
             # Encode output video
+            step_start = time.time()
             await self._encode_video(
                 processed_dir,
                 output_video,
                 fps,
                 audio_file if has_audio and audio_file.exists() else None
             )
+            stats["timing_breakdown"]["encode_video"] = round(time.time() - step_start, 2)
+            self._log(f"Encoded video in {stats['timing_breakdown']['encode_video']:.1f}s")
 
             # Read output
             output_bytes = await asyncio.to_thread(output_video.read_bytes)
 
-            stats["processing_time_seconds"] = round(time.time() - start_time, 2)
+            stats["processing_time_seconds"] = round(time.time() - total_start, 2)
+            stats["output_size_mb"] = round(len(output_bytes) / 1024 / 1024, 2)
+
+            self._log(f"=== Processing complete: {stats['processing_time_seconds']}s total, "
+                      f"{stats['output_size_mb']} MB output ===", force=True)
+            self._log(f"Timing breakdown: {stats['timing_breakdown']}", force=True)
 
             return output_bytes, stats
 
@@ -818,15 +879,23 @@ class VideoProcessor:
         if result.returncode != 0:
             print(f"Audio extraction skipped: {result.stderr}")
 
-    async def _process_keyframes(self, frame_files: list[Path]) -> dict[int, dict]:
+    async def _process_keyframes(self, frame_files: list[Path], keyframe_interval: int) -> tuple[dict[int, dict], dict]:
         """
         Identify keyframes and run detection on them.
 
-        Returns dict mapping frame index to detection data.
+        Returns:
+            - dict mapping frame index to detection data
+            - stats dict with keyframe breakdown
         """
+        import time
+
         keyframe_data = {}
+        keyframe_stats = {"scene_changes": 0, "time_based": 0, "first_frame": 0}
         prev_frame_array = None
-        last_keyframe_idx = -self.keyframe_interval  # Force first frame to be keyframe
+        last_keyframe_idx = -keyframe_interval  # Force first frame to be keyframe
+
+        total_frames = len(frame_files)
+        detection_times = []
 
         for idx, frame_path in enumerate(frame_files):
             # Load frame for comparison
@@ -836,32 +905,53 @@ class VideoProcessor:
 
             # Determine if this is a keyframe
             is_keyframe = False
+            keyframe_reason = None
 
             # Always make first frame a keyframe
             if idx == 0:
                 is_keyframe = True
+                keyframe_reason = "first_frame"
             # Time-distributed keyframe (fallback interval)
-            elif idx - last_keyframe_idx >= self.keyframe_interval:
+            elif idx - last_keyframe_idx >= keyframe_interval:
                 is_keyframe = True
+                keyframe_reason = "time_based"
             # Scene change detection
             elif prev_frame_array is not None:
                 diff = self._frame_difference(prev_frame_array, frame_array)
                 if diff > self.scene_change_threshold:
                     is_keyframe = True
-                    print(f"Scene change detected at frame {idx}, diff={diff:.3f}")
+                    keyframe_reason = "scene_change"
+                    self._log(f"Scene change at frame {idx}/{total_frames}, diff={diff:.3f}")
 
             if is_keyframe:
                 # Run detection on this keyframe
+                detect_start = time.time()
                 detections = await self._detect_frame(frame_bytes)
+                detect_time = time.time() - detect_start
+                detection_times.append(detect_time)
+
+                censor_boxes = self._extract_censor_boxes(detections)
                 keyframe_data[idx] = {
                     "detections": detections,
-                    "boxes": self._extract_censor_boxes(detections)
+                    "boxes": censor_boxes
                 }
                 last_keyframe_idx = idx
+                keyframe_stats[keyframe_reason] = keyframe_stats.get(keyframe_reason, 0) + 1
+
+                self._log(f"Keyframe {len(keyframe_data)}: frame {idx}/{total_frames} ({keyframe_reason}), "
+                          f"{len(detections)} detections, {len(censor_boxes)} to censor, {detect_time:.2f}s")
 
             prev_frame_array = frame_array
 
-        return keyframe_data
+            # Progress logging every 25%
+            if idx > 0 and idx % max(1, total_frames // 4) == 0:
+                self._log(f"Keyframe scan progress: {idx}/{total_frames} frames ({100*idx//total_frames}%)")
+
+        if detection_times:
+            avg_detect = sum(detection_times) / len(detection_times)
+            self._log(f"Average detection time per keyframe: {avg_detect:.2f}s")
+
+        return keyframe_data, keyframe_stats
 
     def _get_comparison_array(self, image: Image.Image) -> np.ndarray:
         """Convert image to small grayscale array for fast comparison."""
@@ -875,21 +965,34 @@ class VideoProcessor:
         return float(np.mean(diff) / 255.0)
 
     async def _detect_frame(self, frame_bytes: bytes) -> list[dict]:
-        """Run nudity detection on a single frame."""
-        # Use the dual-model detection
-        detections_320n, detections_640m = await asyncio.gather(
-            self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD),
-            self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
-        )
+        """Run nudity detection on a single frame using configured model(s)."""
+        if self.use_dual_models:
+            # Use both models for maximum coverage
+            detections_320n, detections_640m = await asyncio.gather(
+                self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD),
+                self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
+            )
 
-        # Tag and merge
-        for d in detections_320n:
-            d["model"] = "320n"
-        for d in detections_640m:
-            d["model"] = "640m"
+            # Tag and merge
+            for d in detections_320n:
+                d["model"] = "320n"
+            for d in detections_640m:
+                d["model"] = "640m"
 
-        all_detections = detections_320n + detections_640m
-        return self.censor._merge_detections(all_detections)
+            all_detections = detections_320n + detections_640m
+            return self.censor._merge_detections(all_detections)
+        else:
+            # Use single model for speed
+            if self.primary_model == "640m":
+                detections = await self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
+                for d in detections:
+                    d["model"] = "640m"
+            else:
+                detections = await self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
+                for d in detections:
+                    d["model"] = "320n"
+
+            return self.censor._merge_detections(detections)
 
     def _extract_censor_boxes(self, detections: list[dict]) -> list[dict]:
         """Extract boxes that need censoring."""
@@ -910,9 +1013,13 @@ class VideoProcessor:
         output_dir: Path
     ):
         """Apply censorship to all frames with smooth box interpolation."""
+        import time
+
+        total_frames = len(frame_files)
 
         if not keyframe_data:
             # No keyframes = no detections, just copy frames
+            self._log(f"No detections found, copying {total_frames} frames unchanged")
             for idx, frame_path in enumerate(frame_files):
                 shutil.copy(frame_path, output_dir / f"frame_{idx:06d}.png")
             return
@@ -921,16 +1028,21 @@ class VideoProcessor:
         keyframe_indices = sorted(keyframe_data.keys())
 
         # Process frames in batches for efficiency
-        batch_size = 10
+        batch_size = self.batch_size
         frame_batches = [
-            frame_files[i:i + batch_size]
+            (i, frame_files[i:i + batch_size])
             for i in range(0, len(frame_files), batch_size)
         ]
 
-        for batch_start_idx, batch in enumerate(frame_batches):
+        total_batches = len(frame_batches)
+        self._log(f"Processing {total_frames} frames in {total_batches} batches (batch_size={batch_size})")
+
+        for batch_idx, (start_idx, batch) in enumerate(frame_batches):
+            batch_start = time.time()
             tasks = []
+
             for local_idx, frame_path in enumerate(batch):
-                frame_idx = batch_start_idx * batch_size + local_idx
+                frame_idx = start_idx + local_idx
                 output_path = output_dir / f"frame_{frame_idx:06d}.png"
 
                 # Get interpolated boxes for this frame
@@ -945,6 +1057,13 @@ class VideoProcessor:
                 )
 
             await asyncio.gather(*tasks)
+
+            # Progress logging
+            if (batch_idx + 1) % max(1, total_batches // 4) == 0 or batch_idx == total_batches - 1:
+                progress = (batch_idx + 1) * 100 // total_batches
+                batch_time = time.time() - batch_start
+                self._log(f"Censorship progress: batch {batch_idx + 1}/{total_batches} ({progress}%), "
+                          f"last batch took {batch_time:.2f}s")
 
     def _get_interpolated_boxes(
         self,
@@ -1991,9 +2110,14 @@ async def root():
                 "smart_keyframes": True,
                 "scene_change_detection": True,
                 "smooth_box_interpolation": True,
-                "keyframe_interval_frames": VIDEO_KEYFRAME_INTERVAL,
+                "keyframe_interval_seconds": VIDEO_KEYFRAME_INTERVAL_SECONDS,
                 "scene_change_threshold": VIDEO_SCENE_CHANGE_THRESHOLD,
                 "max_duration_seconds": VIDEO_MAX_DURATION,
+                "target_fps": VIDEO_TARGET_FPS,
+                "use_dual_models": VIDEO_USE_DUAL_MODELS,
+                "primary_model": VIDEO_PRIMARY_MODEL,
+                "batch_size": VIDEO_BATCH_SIZE,
+                "verbose_logging": VIDEO_VERBOSE_LOGGING,
             } if ffmpeg_available else None,
         },
         "cache_stats": {
