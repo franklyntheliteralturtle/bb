@@ -8,6 +8,7 @@ import io
 import json
 import hashlib
 import asyncio
+import tempfile
 from pathlib import Path
 from typing import AsyncIterable
 from contextlib import asynccontextmanager
@@ -117,19 +118,43 @@ class RedGifsClient:
         return self._parse_gif(result)
 
     async def download_media(self, gif_id: str) -> tuple[bytes, str]:
+        """
+        Download media for a GIF. Returns (bytes, content_type).
+        Uses the library's download method which requires a file path.
+        """
         api = await self.get_api()
         gif = await asyncio.to_thread(api.get_gif, gif_id)
         url = gif.urls.thumbnail or gif.urls.poster
         if not url:
             raise Exception("No thumbnail available")
-        media_bytes = await asyncio.to_thread(api.download, url)
+
+        # Determine content type from URL
         content_type = "image/jpeg"
+        suffix = ".jpg"
         if url.endswith(".png"):
             content_type = "image/png"
+            suffix = ".png"
         elif url.endswith(".gif"):
             content_type = "image/gif"
+            suffix = ".gif"
         elif url.endswith(".webp"):
             content_type = "image/webp"
+            suffix = ".webp"
+
+        # Download to temp file (redgifs library requires file path)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            await asyncio.to_thread(api.download, url, tmp_path)
+            media_bytes = await asyncio.to_thread(Path(tmp_path).read_bytes)
+        finally:
+            # Clean up temp file
+            try:
+                Path(tmp_path).unlink()
+            except Exception:
+                pass
+
         return media_bytes, content_type
 
     def _parse_search_result(self, result) -> dict:
