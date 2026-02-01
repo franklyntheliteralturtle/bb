@@ -27,7 +27,6 @@ from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 
 import redgifs
-from redgifs import Order
 
 load_dotenv()
 
@@ -712,63 +711,12 @@ class RedGifsClient:
 
     async def get_trending(self, page: int = 1, count: int = 40) -> dict:
         """
-        Get trending GIFs from RedGifs.
+        Get trending GIFs from RedGifs using get_top_this_week().
         This is our primary content source - we cache everything and filter by tags locally.
-
-        Args:
-            page: Page number (1-indexed)
-            count: Number of results per page
         """
         api = await self.get_api()
-        last_error = None
-
-        # Try multiple approaches to get trending content
-        # Approach 1: get_trending_gifs() - no parameters in some versions
-        try:
-            result = await asyncio.to_thread(api.get_trending_gifs)
-            return self._parse_search_result(result)
-        except Exception as e:
-            last_error = e
-            print(f"get_trending_gifs() failed: {e}")
-
-        # Approach 2: get_feeds with trending type
-        try:
-            result = await asyncio.to_thread(
-                api.get_feeds,
-                "trending",
-                count=count,
-                page=page
-            )
-            return self._parse_search_result(result)
-        except Exception as e:
-            last_error = e
-            print(f"get_feeds('trending') failed: {e}")
-
-        # Approach 3: search_creators or explore
-        try:
-            # Try to get from explore/featured
-            result = await asyncio.to_thread(api.get_top_this_week)
-            return self._parse_search_result(result)
-        except Exception as e:
-            last_error = e
-            print(f"get_top_this_week() failed: {e}")
-
-        # Approach 4: Use search with a common/popular tag
-        try:
-            result = await asyncio.to_thread(
-                api.search,
-                "verified",  # Common tag that should return results
-                order=Order.TRENDING,
-                count=count,
-                page=page
-            )
-            return self._parse_search_result(result)
-        except Exception as e:
-            last_error = e
-            print(f"search('verified', TRENDING) failed: {e}")
-
-        # If all approaches fail, raise the last error
-        raise RuntimeError(f"Could not fetch trending content: {last_error}")
+        result = await asyncio.to_thread(api.get_top_this_week)
+        return self._parse_search_result(result)
 
     async def get_gif(self, gif_id: str) -> dict:
         api = await self.get_api()

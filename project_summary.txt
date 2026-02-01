@@ -1,0 +1,84 @@
+## Project Summary: Super Browser
+
+### What It Is
+A Poe Canvas App system for browsing RedGifs content with **automated server-side nudity censorship**. The architecture consists of:
+- **Canvas App** (frontend) - HTML/CSS/JS running in Poe's iframe
+- **Railway Server** (backend) - FastAPI with Poe Protocol, hosting a bot called "SuperBrowser"
+
+### Core Features Implemented
+1. **Dual-Model Nudity Detection** - Uses two NudeNet ONNX models (320n and 640m) running in parallel for better coverage
+2. **Direct ONNX Inference** - No OpenCV dependency (Railway doesn't have X11 libraries). Uses only `onnxruntime`, `numpy`, and `Pillow`
+3. **Black Box Censoring** - Detected NSFW regions get black rectangles drawn over them
+4. **Local Tag Filtering** - RedGifs search API is broken, so we:
+   - Fetch content from **trending only**
+   - Cache everything locally with SQLite
+   - Build a tag index from cached content
+   - Filter by tags from the local cache
+
+### Key Technical Decisions
+- **No OpenCV**: Direct ONNX inference with manual preprocessing (NCHW format, normalization) and postprocessing (YOLO output parsing, NMS)
+- **Dual label support**: vladmandic model uses different class names than official NudeNet - code detects model type by file size
+
+### Database Schema (SQLite)
+- `gif_cache` - Main GIF metadata storage
+- `gif_tags` - Many-to-many relationship between GIFs and tags
+- `tag_index` - Tag names with counts for quick lookup
+- `processed_media` - Paths to censored images + detection results
+- `captions` - Stored captions for GIFs
+
+### Bot Commands
+- `browse` / `trending` - Fetch trending from RedGifs, cache it
+- `browse <tag>` / `<tag>` - Filter cached content by tag
+- `tags` - List available cached tags with counts
+- `item <gif_id>` - Get specific GIF details
+- `help` - Show help
+
+### REST Endpoints
+- `GET /` - Health check with cache stats
+- `GET /media/{gif_id}` - Serve censored image (processes on first request)
+- `GET /media/{gif_id}/detections` - Get detection results
+- `GET /tags` - List cached tags with counts
+- `GET /browse/tag/{tag}` - Get cached GIFs by tag
+
+### Current State
+The backend (`main.py`) is fully implemented with:
+- Trending-only content fetching
+- Local tag caching and filtering
+- Dual-model nudity detection and censoring
+- All REST endpoints
+
+### Files
+- `main.py` - The complete FastAPI server with Poe bot
+- `requirements.txt` - Dependencies (no OpenCV!)
+
+### Dependencies (requirements.txt)
+```
+fastapi-poe==0.0.48
+fastapi==0.109.2
+uvicorn[standard]==0.27.1
+redgifs>=2.3.0
+Pillow>=10.4.0
+httpx>=0.26.0
+aiosqlite>=0.19.0
+python-dotenv>=1.0.0
+sse-starlette==1.8.2
+onnxruntime>=1.18.0
+numpy>=1.24.0
+```
+
+### Environment Variables
+- `DATABASE_PATH` - SQLite database path (default: `cache.db`)
+- `MEDIA_CACHE_DIR` - Where to store processed images (default: `media_cache`)
+- `MODEL_CACHE_DIR` - Where to store ONNX models (default: `models`)
+- `POE_ACCESS_KEY` - Poe API access key
+- `BOT_NAME` - Bot name (default: `SuperBrowser`)
+- `SERVER_URL` - Public URL of the server (for generating media URLs)
+- `CENSOR_THRESHOLD` - Detection confidence threshold (default: `0.4`)
+
+---
+
+### Instructions for Future Instance
+1. **When outputting modified files**: Use the `mcp__attachments__output` tool and specify just the filename (e.g., `["main.py"]`), not the full path with `mnt/`
+2. The backend code is in `mnt/main.py` on the working directory
+3. The Canvas App frontend (`index.html`) has not been created yet
+4. If the user reports errors, check the RedGifs API calls first - the library's API changes between versions
