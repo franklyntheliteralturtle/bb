@@ -697,16 +697,34 @@ class RedGifsClient:
         api = await self.get_api()
 
         # Map order string to Order enum
+        # Map order string to Order enum - only use values that exist in the library
+        # Available: TRENDING, LATEST, TOP (and aliases like BEST, NEW, RECENT)
         order_map = {
-            "latest": Order.LATEST,
-            "new": Order.LATEST,
+            "latest": Order.TRENDING,  # Use TRENDING as fallback since LATEST may not exist
+            "new": Order.TRENDING,
             "trending": Order.TRENDING,
-            "top": Order.TOP,
-            "top7": Order.TOP7,
-            "top28": Order.TOP28,
-            "best": Order.BEST,
+            "top": Order.TRENDING,
+            "best": Order.TRENDING,
         }
-        order_enum = order_map.get(order.lower(), Order.LATEST)
+
+        # Try to use the actual Order values if they exist
+        try:
+            order_map["latest"] = Order.LATEST
+            order_map["new"] = Order.LATEST
+        except AttributeError:
+            pass
+
+        try:
+            order_map["top"] = Order.TOP
+        except AttributeError:
+            pass
+
+        try:
+            order_map["best"] = Order.BEST
+        except AttributeError:
+            pass
+
+        order_enum = order_map.get(order.lower(), Order.TRENDING)
 
         # Use search_gifs for tag-based searching
         # This searches specifically by tags rather than general text
@@ -942,7 +960,7 @@ class SuperBrowserBot(fp.PoeBot):
         for arg in args[1:]:
             if arg.isdigit():
                 page = int(arg)
-            elif arg.lower() in ["latest", "trending", "top", "top7", "top28", "new", "best"]:
+            elif arg.lower() in ["latest", "trending", "top", "new", "best"]:
                 order = arg.lower()
 
         yield fp.PartialResponse(text=f"🔍 Searching for **{tag}** (page {page}, {order})...\n\n")
@@ -1036,14 +1054,11 @@ class SuperBrowserBot(fp.PoeBot):
   - `order`: Sort order (default: latest)
     - `latest` - Most recent uploads
     - `trending` - Currently popular
-    - `top` - All-time top rated
-    - `top7` - Top rated this week
-    - `top28` - Top rated this month
+    - `top` - Top rated
   - Examples:
     - `browse blonde` - Latest blonde content
     - `browse amateur 2` - Page 2 of amateur
     - `browse milf trending` - Trending milf content
-    - `browse asian 3 top7` - Page 3, top of the week
 
 - `item <gif_id>` - Get a specific item with caption
   - Example: `item abcxyz123`
