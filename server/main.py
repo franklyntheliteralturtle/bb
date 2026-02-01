@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 
 import redgifs
-from redgifs import Order, Tags
+from redgifs import Order
 
 load_dotenv()
 
@@ -626,6 +626,7 @@ nudenet_censor = NudeNetCensor()
 async def init_db():
     """Initialize SQLite database with required tables."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Main GIF cache table
         await db.execute("""
             CREATE TABLE IF NOT EXISTS gif_cache (
                 id TEXT PRIMARY KEY,
@@ -641,6 +642,31 @@ async def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+
+        # Tag index table - tracks which tags exist and their counts
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS tag_index (
+                tag TEXT PRIMARY KEY,
+                count INTEGER DEFAULT 0,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+
+        # GIF-to-tag mapping for efficient tag-based queries
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS gif_tags (
+                gif_id TEXT,
+                tag TEXT,
+                PRIMARY KEY (gif_id, tag),
+                FOREIGN KEY (gif_id) REFERENCES gif_cache(id)
+            )
+        """)
+
+        # Create index for faster tag lookups
+        await db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_gif_tags_tag ON gif_tags(tag)
+        """)
+
         await db.execute("""
             CREATE TABLE IF NOT EXISTS captions (
                 gif_id TEXT PRIMARY KEY,
@@ -684,70 +710,41 @@ class RedGifsClient:
         api.login()
         return api
 
-    async def search(self, query: str, page: int = 1, count: int = 20, order: str = "latest") -> dict:
+    async def get_trending(self, page: int = 1, count: int = 40) -> dict:
         """
-        Search for GIFs by tag/query.
+        Get trending GIFs from RedGifs.
+        This is our primary content source - we cache everything and filter by tags locally.
 
         Args:
-            query: Tag or search term
             page: Page number (1-indexed)
             count: Number of results per page
-            order: Sort order - "latest", "trending", "top", "top7", "top28"
         """
         api = await self.get_api()
 
-        # Map order string to Order enum
-        # Map order string to Order enum - only use values that exist in the library
-        # Available: TRENDING, LATEST, TOP (and aliases like BEST, NEW, RECENT)
-        order_map = {
-            "latest": Order.TRENDING,  # Use TRENDING as fallback since LATEST may not exist
-            "new": Order.TRENDING,
-            "trending": Order.TRENDING,
-            "top": Order.TRENDING,
-            "best": Order.TRENDING,
-        }
-
-        # Try to use the actual Order values if they exist
         try:
-            order_map["latest"] = Order.LATEST
-            order_map["new"] = Order.LATEST
-        except AttributeError:
-            pass
-
-        try:
-            order_map["top"] = Order.TOP
-        except AttributeError:
-            pass
-
-        try:
-            order_map["best"] = Order.BEST
-        except AttributeError:
-            pass
-
-        order_enum = order_map.get(order.lower(), Order.TRENDING)
-
-        # Try using Tags object for proper tag-based search
-        # According to docs: search_text can be "a string or an instance of Tags"
-        try:
-            # Create a Tags instance with the query as a tag
-            tags_obj = Tags(query)
+            # Try get_trending_gifs first
             result = await asyncio.to_thread(
-                api.search,
-                tags_obj,
-                order=order_enum,
+                api.get_trending_gifs,
                 count=count,
                 page=page
             )
-        except (TypeError, ValueError) as e:
-            # Fallback to regular string search if Tags doesn't work
-            print(f"Tags search failed ({e}), falling back to text search")
-            result = await asyncio.to_thread(
-                api.search,
-                query,
-                order=order_enum,
-                count=count,
-                page=page
-            )
+        except (AttributeError, TypeError):
+            try:
+                # Fallback to search with trending order
+                result = await asyncio.to_thread(
+                    api.search,
+                    "",  # Empty search = trending
+                    order=Order.TRENDING,
+                    count=count,
+                    page=page
+                )
+            except Exception:
+                # Last resort: get top gifs
+                result = await asyncio.to_thread(
+                    api.get_top_this_week,
+                    count=count,
+                    page=page
+                )
 
         return self._parse_search_result(result)
 
@@ -846,13 +843,18 @@ async def get_cached_gif(gif_id: str) -> dict | None:
 
 
 async def cache_gif(gif_data: dict):
+    """Cache a GIF and update tag indexes."""
+    gif_id = gif_data["id"]
+    tags = gif_data.get("tags", []) or []
+
     async with aiosqlite.connect(DATABASE_PATH) as db:
+        # Insert/update the main GIF cache
         await db.execute("""
             INSERT OR REPLACE INTO gif_cache
             (id, thumbnail_url, hd_url, sd_url, web_url, width, height, duration, tags, username)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            gif_data["id"],
+            gif_id,
             gif_data.get("thumbnail_url"),
             gif_data.get("hd_url"),
             gif_data.get("sd_url"),
@@ -860,10 +862,114 @@ async def cache_gif(gif_data: dict):
             gif_data.get("width"),
             gif_data.get("height"),
             gif_data.get("duration"),
-            ",".join(gif_data.get("tags", []) if gif_data.get("tags") else []),
+            ",".join(tags),
             gif_data.get("username"),
         ))
+
+        # Update gif_tags mapping and tag_index counts
+        for tag in tags:
+            tag_lower = tag.lower().strip()
+            if not tag_lower:
+                continue
+
+            # Check if this gif-tag relationship already exists
+            cursor = await db.execute(
+                "SELECT 1 FROM gif_tags WHERE gif_id = ? AND tag = ?",
+                (gif_id, tag_lower)
+            )
+            exists = await cursor.fetchone()
+
+            if not exists:
+                # Insert new gif-tag relationship
+                await db.execute(
+                    "INSERT OR IGNORE INTO gif_tags (gif_id, tag) VALUES (?, ?)",
+                    (gif_id, tag_lower)
+                )
+
+                # Update tag count (insert or increment)
+                await db.execute("""
+                    INSERT INTO tag_index (tag, count, last_updated)
+                    VALUES (?, 1, CURRENT_TIMESTAMP)
+                    ON CONFLICT(tag) DO UPDATE SET
+                        count = count + 1,
+                        last_updated = CURRENT_TIMESTAMP
+                """, (tag_lower,))
+
         await db.commit()
+
+
+async def get_available_tags(limit: int = 100) -> list[dict]:
+    """Get all available tags with their counts, sorted by count descending."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cursor = await db.execute("""
+            SELECT tag, count FROM tag_index
+            WHERE count > 0
+            ORDER BY count DESC
+            LIMIT ?
+        """, (limit,))
+        rows = await cursor.fetchall()
+        return [{"tag": row["tag"], "count": row["count"]} for row in rows]
+
+
+async def get_gifs_by_tag(tag: str, page: int = 1, count: int = 20) -> dict:
+    """Get cached GIFs that have a specific tag."""
+    tag_lower = tag.lower().strip()
+    offset = (page - 1) * count
+
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Get total count for this tag
+        cursor = await db.execute(
+            "SELECT count FROM tag_index WHERE tag = ?",
+            (tag_lower,)
+        )
+        row = await cursor.fetchone()
+        total = row["count"] if row else 0
+
+        if total == 0:
+            return {
+                "page": page,
+                "pages": 0,
+                "total": 0,
+                "gifs": []
+            }
+
+        # Get GIF IDs for this tag
+        cursor = await db.execute("""
+            SELECT gc.* FROM gif_cache gc
+            INNER JOIN gif_tags gt ON gc.id = gt.gif_id
+            WHERE gt.tag = ?
+            ORDER BY gc.created_at DESC
+            LIMIT ? OFFSET ?
+        """, (tag_lower, count, offset))
+
+        rows = await cursor.fetchall()
+        gifs = []
+        for row in rows:
+            tags_str = row["tags"] or ""
+            gifs.append({
+                "id": row["id"],
+                "thumbnail_url": row["thumbnail_url"],
+                "hd_url": row["hd_url"],
+                "sd_url": row["sd_url"],
+                "web_url": row["web_url"],
+                "width": row["width"],
+                "height": row["height"],
+                "duration": row["duration"],
+                "tags": tags_str.split(",") if tags_str else [],
+                "username": row["username"],
+            })
+
+        pages = (total + count - 1) // count  # Ceiling division
+
+        return {
+            "page": page,
+            "pages": pages,
+            "total": total,
+            "gifs": gifs
+        }
 
 
 async def get_cached_caption(gif_id: str) -> str | None:
@@ -929,12 +1035,20 @@ class SuperBrowserBot(fp.PoeBot):
             if command == "browse":
                 async for response in self._handle_browse(args):
                     yield response
+            elif command == "trending":
+                # Alias for browse with no tag
+                async for response in self._handle_browse(args):
+                    yield response
+            elif command == "tags":
+                async for response in self._handle_tags(args):
+                    yield response
             elif command == "item":
                 async for response in self._handle_item(args):
                     yield response
             elif command == "help":
                 yield fp.PartialResponse(text=self._get_help_text())
             else:
+                # Treat unknown command as a tag to browse
                 async for response in self._handle_browse([command] + args):
                     yield response
 
@@ -945,62 +1059,127 @@ class SuperBrowserBot(fp.PoeBot):
         """
         Handle browse command.
 
-        Usage: browse <tag> [page] [order]
-        - tag: The tag to search for
-        - page: Page number (default: 1)
-        - order: Sort order - latest, trending, top, top7, top28 (default: latest)
+        - No args: Get trending content from RedGifs (cached for future tag filtering)
+        - With tag: Filter locally cached content by that tag
+
+        Usage: browse [tag] [page]
         """
-        if not args:
-            yield fp.PartialResponse(text="Please specify a tag to browse. Example: `browse cats`")
-            return
-
-        tag = args[0]
         page = 1
-        order = "latest"  # Default to latest for fresh results
-        count = 20  # More results per page for infinite scroll
+        count = 20
+        tag = None
 
-        # Parse optional arguments
-        for arg in args[1:]:
+        # Parse arguments
+        for arg in args:
             if arg.isdigit():
                 page = int(arg)
-            elif arg.lower() in ["latest", "trending", "top", "new", "best"]:
-                order = arg.lower()
+            else:
+                tag = arg
 
-        yield fp.PartialResponse(text=f"🔍 Searching for **{tag}** (page {page}, {order})...\n\n")
+        if tag:
+            # Filter by tag from local cache
+            yield fp.PartialResponse(text=f"🏷️ Filtering cached content for **{tag}** (page {page})...\n\n")
 
-        try:
-            # Always fetch fresh results - no caching of browse listings
-            result = await redgifs_client.search(tag, page=page, count=count, order=order)
-        except Exception as e:
-            yield fp.PartialResponse(text=f"Error fetching from RedGifs: {str(e)}")
+            result = await get_gifs_by_tag(tag, page=page, count=count)
+
+            if result["total"] == 0:
+                # Get available tags to suggest alternatives
+                available_tags = await get_available_tags(20)
+                tag_list = ", ".join([f"`{t['tag']}` ({t['count']})" for t in available_tags[:10]])
+                yield fp.PartialResponse(
+                    text=f"No cached content found for tag **{tag}**.\n\n"
+                    f"Available tags: {tag_list if tag_list else 'None yet - browse trending first!'}\n\n"
+                    "Use `browse` (no tag) to fetch trending content and build up the cache."
+                )
+                return
+
+            response_data = {
+                "type": "browse_result",
+                "source": "cache",
+                "tag": tag,
+                "page": result["page"],
+                "pages": result["pages"],
+                "total": result["total"],
+                "items": []
+            }
+
+            for gif in result["gifs"]:
+                media_url = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
+                response_data["items"].append({
+                    "id": gif["id"],
+                    "thumbnail_url": gif["thumbnail_url"],
+                    "hd_url": gif["hd_url"],
+                    "sd_url": gif["sd_url"],
+                    "web_url": gif["web_url"],
+                    "media_url": media_url,
+                    "username": gif.get("username"),
+                    "tags": gif.get("tags", []),
+                })
+
+        else:
+            # Fetch trending from RedGifs and cache it
+            yield fp.PartialResponse(text=f"🔥 Fetching trending content (page {page})...\n\n")
+
+            try:
+                result = await redgifs_client.get_trending(page=page, count=count)
+            except Exception as e:
+                yield fp.PartialResponse(text=f"Error fetching from RedGifs: {str(e)}")
+                return
+
+            # Cache all GIFs and their tags
+            for gif in result["gifs"]:
+                await cache_gif(gif)
+
+            response_data = {
+                "type": "browse_result",
+                "source": "trending",
+                "page": result["page"],
+                "pages": result["pages"],
+                "total": result["total"],
+                "items": []
+            }
+
+            for gif in result["gifs"]:
+                media_url = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
+                response_data["items"].append({
+                    "id": gif["id"],
+                    "thumbnail_url": gif["thumbnail_url"],
+                    "hd_url": gif["hd_url"],
+                    "sd_url": gif["sd_url"],
+                    "web_url": gif["web_url"],
+                    "media_url": media_url,
+                    "username": gif.get("username"),
+                    "tags": gif.get("tags", []),
+                })
+
+        yield fp.PartialResponse(text=f"```json\n{json.dumps(response_data, indent=2)}\n```")
+
+    async def _handle_tags(self, args: list[str]) -> AsyncIterable[fp.PartialResponse]:
+        """
+        Handle tags command - list available tags from the cache.
+
+        Usage: tags [limit]
+        """
+        limit = 50  # Default limit
+        for arg in args:
+            if arg.isdigit():
+                limit = min(int(arg), 200)  # Cap at 200
+
+        yield fp.PartialResponse(text="🏷️ Fetching available tags from cache...\n\n")
+
+        tags = await get_available_tags(limit)
+
+        if not tags:
+            yield fp.PartialResponse(
+                text="No tags cached yet.\n\n"
+                "Use `browse` or `trending` to fetch content from RedGifs and build up the tag cache."
+            )
             return
 
-        # Note: We don't cache browse results - only individual GIF metadata
-        # when they are accessed via /media/{id} endpoint
-
         response_data = {
-            "type": "browse_result",
-            "tag": tag,
-            "page": result["page"],
-            "pages": result["pages"],
-            "total": result["total"],
-            "order": order,
-            "items": []
+            "type": "tags_result",
+            "total": len(tags),
+            "tags": tags
         }
-
-        for gif in result["gifs"]:
-            media_url = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
-
-            response_data["items"].append({
-                "id": gif["id"],
-                "thumbnail_url": gif["thumbnail_url"],
-                "hd_url": gif["hd_url"],
-                "sd_url": gif["sd_url"],
-                "web_url": gif["web_url"],
-                "media_url": media_url,
-                "username": gif.get("username"),
-                "tags": gif.get("tags", []),
-            })
 
         yield fp.PartialResponse(text=f"```json\n{json.dumps(response_data, indent=2)}\n```")
 
@@ -1051,27 +1230,40 @@ class SuperBrowserBot(fp.PoeBot):
 
 **Commands:**
 
-- `browse <tag> [page] [order]` - Browse GIFs by tag
-  - `tag`: The tag to search for
-  - `page`: Page number (default: 1)
-  - `order`: Sort order (default: latest)
-    - `latest` - Most recent uploads
-    - `trending` - Currently popular
-    - `top` - Top rated
+- `browse` or `trending` - Get trending content from RedGifs
+  - Automatically caches all content and their tags
+  - Use `browse 2`, `browse 3`, etc. for more pages
   - Examples:
-    - `browse blonde` - Latest blonde content
-    - `browse amateur 2` - Page 2 of amateur
-    - `browse milf trending` - Trending milf content
+    - `browse` - Get page 1 of trending
+    - `trending 5` - Get page 5 of trending
+
+- `browse <tag> [page]` or just `<tag> [page]` - Filter cached content by tag
+  - Only searches content already cached from trending
+  - Examples:
+    - `browse blonde` - Cached content tagged "blonde"
+    - `amateur 2` - Page 2 of cached "amateur" content
+    - `milf` - Cached content tagged "milf"
+
+- `tags [limit]` - List available tags from cache with counts
+  - Shows which tags have cached content
+  - Example: `tags 50` - Top 50 tags by count
 
 - `item <gif_id>` - Get a specific item with caption
   - Example: `item abcxyz123`
 
 - `help` - Show this help message
 
+**How It Works:**
+1. Use `browse` (no tag) to fetch trending content
+2. Content is automatically cached with all its tags
+3. Use `tags` to see what's available
+4. Use `browse <tag>` to filter cached content by tag
+
 **Features:**
 - 🔒 Dual-model AI nudity censoring (320n + 640m)
 - 📦 Processed images served from `/media/{id}`
-- 🔄 Fresh results on every browse (no stale cache)
+- 🏷️ Local tag filtering (more reliable than API search)
+- 💾 All content cached for instant tag-based browsing
 
 **For Canvas Apps:**
 Responses are returned as JSON in code blocks for easy parsing.
@@ -1081,7 +1273,13 @@ Responses are returned as JSON in code blocks for easy parsing.
         """Return bot settings."""
         return fp.SettingsResponse(
             server_bot_dependencies={},
-            introduction_message="Welcome to Super Browser! 🌐\n\nUse `browse <tag>` to search for content, or type `help` for more commands.\n\n🔒 All images are processed with automated nudity censoring.",
+            introduction_message="Welcome to Super Browser! 🌐\n\n"
+            "**Quick Start:**\n"
+            "• `browse` - Get trending content (builds cache)\n"
+            "• `tags` - See available tags with counts\n"
+            "• `browse <tag>` - Filter cached content by tag\n\n"
+            "🔒 All images are processed with automated nudity censoring.\n\n"
+            "Type `help` for more commands.",
         )
 
 
@@ -1130,6 +1328,11 @@ app.router.lifespan_context = combined_lifespan
 @app.get("/")
 async def root():
     """Health check."""
+    # Get tag stats
+    tags = await get_available_tags(limit=5)
+    total_tags_result = await get_available_tags(limit=10000)
+    total_tags = len(total_tags_result)
+
     return {
         "status": "ok",
         "service": "Super Browser Bot",
@@ -1138,7 +1341,16 @@ async def root():
             "dual_model": True,
             "models": ["NudeNet 320n", "NudeNet 640m"],
             "censor_threshold": CENSOR_THRESHOLD,
-            "censor_classes": CENSOR_CLASSES,
+            "local_tag_filtering": True,
+        },
+        "cache_stats": {
+            "total_tags": total_tags,
+            "top_tags": tags[:5] if tags else [],
+        },
+        "endpoints": {
+            "/tags": "GET - List all cached tags with counts",
+            "/browse/tag/{tag}": "GET - Get cached GIFs by tag",
+            "/media/{gif_id}": "GET - Get processed (censored) media",
         }
     }
 
@@ -1177,6 +1389,32 @@ async def get_media_detections(gif_id: str):
             return {"gif_id": gif_id, "detections": json.loads(row[0])}
 
     return {"gif_id": gif_id, "detections": None, "message": "Not processed yet"}
+
+
+@app.get("/tags")
+async def list_tags(limit: int = 100):
+    """Get available tags from cache with counts."""
+    tags = await get_available_tags(limit=min(limit, 500))
+    return {
+        "total": len(tags),
+        "tags": tags
+    }
+
+
+@app.get("/browse/tag/{tag}")
+async def browse_by_tag(tag: str, page: int = 1, count: int = 20):
+    """Get cached GIFs by tag."""
+    result = await get_gifs_by_tag(tag, page=page, count=count)
+
+    # Add media_url to each gif
+    for gif in result["gifs"]:
+        gif["media_url"] = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
+
+    return {
+        "source": "cache",
+        "tag": tag,
+        **result
+    }
 
 
 # =============================================================================
