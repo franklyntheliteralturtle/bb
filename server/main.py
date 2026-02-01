@@ -102,20 +102,30 @@ NUDENET_LABELS_320N = [
 
 # Unified set of NSFW classes to censor (covers both naming conventions)
 DEFAULT_CENSOR_CLASSES = [
-    # vladmandic naming
+    # vladmandic naming - exposed
     "buttocks-bare",
     "female-breast-bare",
     "female-vagina",
     "anus-bare",
     "male-penis",
     "male-breast-bare",
-    # Official 320n naming
+    # vladmandic naming - covered
+    "female-private-area",
+    "female-breast",
+    "buttocks",
+    "anus-area",
+    # Official 320n naming - exposed
     "BUTTOCKS_EXPOSED",
     "FEMALE_BREAST_EXPOSED",
     "FEMALE_GENITALIA_EXPOSED",
     "ANUS_EXPOSED",
     "MALE_GENITALIA_EXPOSED",
     "MALE_BREAST_EXPOSED",
+    # Official 320n naming - covered
+    "BUTTOCKS_COVERED",
+    "FEMALE_BREAST_COVERED",
+    "FEMALE_GENITALIA_COVERED",
+    "ANUS_COVERED",
 ]
 
 CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
