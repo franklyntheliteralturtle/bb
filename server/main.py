@@ -42,15 +42,21 @@ POE_ACCESS_KEY = os.getenv("POE_ACCESS_KEY", "")
 BOT_NAME = os.getenv("BOT_NAME", "SuperBrowser")
 SERVER_URL = os.getenv("SERVER_URL", "")
 
-# NudeNet model URLs - try multiple sources
-# The vladmandic/nudenet repo hosts a compatible model (~12MB)
-NUDENET_MODEL_URLS = [
+# NudeNet model URLs - using dual models for better coverage
+# 320n: Fast, lightweight model (~6MB)
+# 640m: Larger, more accurate model (~25MB)
+NUDENET_320N_URLS = [
     "https://huggingface.co/vladmandic/nudenet/resolve/main/nudenet.onnx",
-    # Fallback to GitHub releases
     "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.onnx",
 ]
-NUDENET_MODEL_PATH = MODEL_CACHE_DIR / "nudenet.onnx"
-NUDENET_MODEL_MIN_SIZE = 5 * 1024 * 1024  # Expect at least 5MB (320n is ~6MB, vladmandic is ~12MB)
+NUDENET_640M_URLS = [
+    "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/640m.onnx",
+]
+
+NUDENET_320N_PATH = MODEL_CACHE_DIR / "320n.onnx"
+NUDENET_640M_PATH = MODEL_CACHE_DIR / "640m.onnx"
+NUDENET_MODEL_MIN_SIZE_320 = 5 * 1024 * 1024   # Expect at least 5MB for 320n
+NUDENET_MODEL_MIN_SIZE_640 = 20 * 1024 * 1024  # Expect at least 20MB for 640m
 
 # Nudity censoring configuration
 CENSOR_THRESHOLD = float(os.getenv("CENSOR_THRESHOLD", "0.4"))
@@ -101,6 +107,7 @@ NUDENET_LABELS_320N = [
 ]
 
 # Unified set of NSFW classes to censor (covers both naming conventions)
+# Includes both exposed AND covered versions of sensitive areas
 DEFAULT_CENSOR_CLASSES = [
     # vladmandic naming - exposed
     "buttocks-bare",
@@ -146,9 +153,19 @@ class NudeDetectorONNX:
     No OpenCV dependency - uses only Pillow and numpy.
     """
 
-    def __init__(self, model_path: Path, input_size: int = 320):
+    def __init__(
+        self,
+        model_path: Path,
+        model_urls: list[str],
+        min_size: int,
+        input_size: int = 320,
+        name: str = "detector"
+    ):
         self.model_path = model_path
+        self.model_urls = model_urls
+        self.min_size = min_size
         self.input_size = input_size
+        self.name = name
         self.session: ort.InferenceSession | None = None
         self.labels: list[str] = NUDENET_LABELS_VLADMANDIC  # Default, updated on load
         self._lock = asyncio.Lock()
@@ -158,29 +175,29 @@ class NudeDetectorONNX:
         # Check if model exists and is valid size
         if self.model_path.exists():
             file_size = self.model_path.stat().st_size
-            if file_size >= NUDENET_MODEL_MIN_SIZE:
-                print(f"Model already exists: {file_size / 1024 / 1024:.1f} MB")
+            if file_size >= self.min_size:
+                print(f"[{self.name}] Model already exists: {file_size / 1024 / 1024:.1f} MB")
                 return
             else:
-                print(f"Model file too small ({file_size} bytes), re-downloading...")
+                print(f"[{self.name}] Model file too small ({file_size} bytes), re-downloading...")
                 self.model_path.unlink()
 
         # Try each URL until one works
         last_error = None
-        for url in NUDENET_MODEL_URLS:
+        for url in self.model_urls:
             try:
-                print(f"Downloading NudeNet model from {url}...")
+                print(f"[{self.name}] Downloading model from {url}...")
                 await self._download_model(url)
-                print(f"Model downloaded successfully: {self.model_path.stat().st_size / 1024 / 1024:.1f} MB")
+                print(f"[{self.name}] Model downloaded successfully: {self.model_path.stat().st_size / 1024 / 1024:.1f} MB")
                 return
             except Exception as e:
-                print(f"Failed to download from {url}: {e}")
+                print(f"[{self.name}] Failed to download from {url}: {e}")
                 last_error = e
                 # Clean up partial download
                 if self.model_path.exists():
                     self.model_path.unlink()
 
-        raise RuntimeError(f"Failed to download model from any source. Last error: {last_error}")
+        raise RuntimeError(f"[{self.name}] Failed to download model from any source. Last error: {last_error}")
 
     async def _download_model(self, url: str):
         """Download model from a specific URL."""
@@ -192,10 +209,10 @@ class NudeDetectorONNX:
             content_size = len(content)
 
             # Verify we got actual model data, not an HTML error page
-            if content_size < NUDENET_MODEL_MIN_SIZE:
+            if content_size < self.min_size:
                 raise RuntimeError(
                     f"Downloaded file too small ({content_size} bytes). "
-                    f"Expected at least {NUDENET_MODEL_MIN_SIZE} bytes."
+                    f"Expected at least {self.min_size} bytes."
                 )
 
             # Check it's not HTML
@@ -212,7 +229,7 @@ class NudeDetectorONNX:
 
             await self.ensure_model_downloaded()
 
-            print("Loading NudeNet ONNX model...")
+            print(f"[{self.name}] Loading ONNX model...")
             # Run in thread to avoid blocking
             self.session = await asyncio.to_thread(
                 ort.InferenceSession,
@@ -221,25 +238,32 @@ class NudeDetectorONNX:
             )
 
             # Detect model type based on output shape
-            # vladmandic model vs official 320n model
             output_shape = self.session.get_outputs()[0].shape
-            print(f"Model output shape: {output_shape}")
+            print(f"[{self.name}] Model output shape: {output_shape}")
 
             # Determine input size from model
             input_shape = self.session.get_inputs()[0].shape
-            print(f"Model input shape: {input_shape}")
+            print(f"[{self.name}] Model input shape: {input_shape}")
+
+            # Update input_size based on model (if detectable from shape)
+            # Shape is typically [batch, channels, height, width] = [1, 3, 320, 320] or [1, 3, 640, 640]
+            if input_shape and len(input_shape) >= 4 and isinstance(input_shape[2], int):
+                self.input_size = input_shape[2]
+                print(f"[{self.name}] Using input size: {self.input_size}")
 
             # Both models should have 18 classes, but file size differs
-            # vladmandic is ~12MB, 320n is ~6MB
+            # vladmandic is ~12MB, 320n/640m are from official repo
             file_size = self.model_path.stat().st_size
-            if file_size > 10 * 1024 * 1024:  # > 10MB = vladmandic
+            if file_size > 10 * 1024 * 1024 and file_size < 20 * 1024 * 1024:
+                # 10-20MB = vladmandic model
                 self.labels = NUDENET_LABELS_VLADMANDIC
-                print("Detected vladmandic/nudenet model")
+                print(f"[{self.name}] Detected vladmandic/nudenet model")
             else:
+                # Official models (320n ~6MB, 640m ~25MB)
                 self.labels = NUDENET_LABELS_320N
-                print("Detected official NudeNet 320n model")
+                print(f"[{self.name}] Detected official NudeNet model")
 
-            print(f"NudeNet model loaded successfully with {len(self.labels)} classes")
+            print(f"[{self.name}] Model loaded successfully with {len(self.labels)} classes")
 
     def _preprocess(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[float, float]]:
         """
@@ -428,14 +452,34 @@ class NudeDetectorONNX:
 class NudeNetCensor:
     """
     Wrapper that combines detection and censoring.
+    Uses dual models (320n and 640m) for better coverage.
     """
 
     def __init__(self):
-        self.detector = NudeDetectorONNX(NUDENET_MODEL_PATH)
+        # Initialize both detectors
+        self.detector_320n = NudeDetectorONNX(
+            model_path=NUDENET_320N_PATH,
+            model_urls=NUDENET_320N_URLS,
+            min_size=NUDENET_MODEL_MIN_SIZE_320,
+            input_size=320,
+            name="320n"
+        )
+        self.detector_640m = NudeDetectorONNX(
+            model_path=NUDENET_640M_PATH,
+            model_urls=NUDENET_640M_URLS,
+            min_size=NUDENET_MODEL_MIN_SIZE_640,
+            input_size=640,
+            name="640m"
+        )
 
     async def load(self):
-        """Pre-load the model."""
-        await self.detector.load()
+        """Pre-load both models in parallel."""
+        print("Loading dual NudeNet models...")
+        await asyncio.gather(
+            self.detector_320n.load(),
+            self.detector_640m.load()
+        )
+        print("Both models loaded successfully!")
 
     async def censor_image(
         self,
@@ -444,7 +488,8 @@ class NudeNetCensor:
         threshold: float = CENSOR_THRESHOLD,
     ) -> tuple[bytes, list[dict]]:
         """
-        Detect and censor nudity in an image.
+        Detect and censor nudity in an image using dual models.
+        Merges results from both 320n and 640m models for maximum coverage.
 
         Args:
             image_bytes: Raw image bytes
@@ -456,18 +501,33 @@ class NudeNetCensor:
         """
         classes_to_censor = classes or CENSOR_CLASSES
 
-        # Detect nudity
-        detections = await self.detector.detect(image_bytes, threshold=threshold)
+        # Run both detectors in parallel
+        detections_320n, detections_640m = await asyncio.gather(
+            self.detector_320n.detect(image_bytes, threshold=threshold),
+            self.detector_640m.detect(image_bytes, threshold=threshold)
+        )
+
+        # Tag detections with source model for debugging
+        for d in detections_320n:
+            d["model"] = "320n"
+        for d in detections_640m:
+            d["model"] = "640m"
+
+        # Merge all detections
+        all_detections = detections_320n + detections_640m
+
+        # Apply NMS across merged detections to remove duplicates
+        merged_detections = self._merge_detections(all_detections)
 
         # Filter detections to censor
         filtered_detections = [
-            d for d in detections
+            d for d in merged_detections
             if d["class"] in classes_to_censor
         ]
 
         if not filtered_detections:
             # No nudity detected that needs censoring
-            return image_bytes, detections
+            return image_bytes, merged_detections
 
         # Apply black boxes
         censored_bytes = await asyncio.to_thread(
@@ -476,7 +536,55 @@ class NudeNetCensor:
             filtered_detections
         )
 
-        return censored_bytes, detections
+        return censored_bytes, merged_detections
+
+    def _merge_detections(self, detections: list[dict], iou_threshold: float = 0.5) -> list[dict]:
+        """
+        Merge detections from multiple models using NMS.
+        Keeps the detection with highest score when boxes overlap.
+        """
+        if not detections:
+            return []
+
+        # Sort by score descending
+        detections = sorted(detections, key=lambda x: x["score"], reverse=True)
+
+        keep = []
+        while detections:
+            best = detections.pop(0)
+            keep.append(best)
+
+            # Remove overlapping detections of the same class
+            detections = [
+                d for d in detections
+                if d["class"] != best["class"] or self._iou(best["box"], d["box"]) < iou_threshold
+            ]
+
+        return keep
+
+    def _iou(self, box1: list[int], box2: list[int]) -> float:
+        """Calculate Intersection over Union between two boxes."""
+        x1, y1, w1, h1 = box1
+        x2, y2, w2, h2 = box2
+
+        box1_x2, box1_y2 = x1 + w1, y1 + h1
+        box2_x2, box2_y2 = x2 + w2, y2 + h2
+
+        inter_x1 = max(x1, x2)
+        inter_y1 = max(y1, y2)
+        inter_x2 = min(box1_x2, box2_x2)
+        inter_y2 = min(box1_y2, box2_y2)
+
+        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+
+        box1_area = w1 * h1
+        box2_area = w2 * h2
+        union_area = box1_area + box2_area - inter_area
+
+        if union_area == 0:
+            return 0
+
+        return inter_area / union_area
 
     def _apply_black_boxes(self, image_bytes: bytes, detections: list[dict]) -> bytes:
         """Apply black boxes over detected regions."""
@@ -940,9 +1048,10 @@ async def root():
         "service": "Super Browser Bot",
         "features": {
             "nudity_censoring": True,
+            "dual_model": True,
+            "models": ["NudeNet 320n", "NudeNet 640m"],
             "censor_threshold": CENSOR_THRESHOLD,
             "censor_classes": CENSOR_CLASSES,
-            "model": "NudeNet 320n (direct ONNX)",
         }
     }
 
