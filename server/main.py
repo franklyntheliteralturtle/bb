@@ -1,6 +1,7 @@
 """
 Super Browser - Poe Server Bot
 A Poe-protocol-compatible server for browsing and processing RedGifs content.
+Features automated nudity detection and censoring using NudeNet.
 """
 
 import os
@@ -15,7 +16,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 import aiosqlite
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 from dotenv import load_dotenv
 
 import fastapi_poe as fp
@@ -25,6 +26,9 @@ from starlette.middleware.cors import CORSMiddleware
 
 import redgifs
 from redgifs import Order
+
+# NudeNet for nudity detection and censoring
+from nudenet import NudeDetector
 
 load_dotenv()
 
@@ -38,8 +42,168 @@ POE_ACCESS_KEY = os.getenv("POE_ACCESS_KEY", "")
 BOT_NAME = os.getenv("BOT_NAME", "SuperBrowser")
 SERVER_URL = os.getenv("SERVER_URL", "")  # Your Railway URL, e.g., https://xxx.up.railway.app
 
+# Nudity censoring configuration
+# Minimum confidence score for detection (0.0 to 1.0)
+CENSOR_THRESHOLD = float(os.getenv("CENSOR_THRESHOLD", "0.4"))
+
+# Body parts to censor (exposed parts only by default)
+DEFAULT_CENSOR_CLASSES = [
+    "FEMALE_BREAST_EXPOSED",
+    "MALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "BUTTOCKS_EXPOSED",
+    "ANUS_EXPOSED",
+]
+
+# Parse custom censor classes from env if provided
+CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
+CENSOR_CLASSES = [c.strip() for c in CENSOR_CLASSES if c.strip()]
+
 # Ensure media cache directory exists
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+# =============================================================================
+# NudeNet Detector (Singleton)
+# =============================================================================
+
+class NudeNetCensor:
+    """
+    Singleton wrapper for NudeNet detector.
+    Handles thread-safe initialization and provides censoring functionality.
+    """
+
+    def __init__(self):
+        self._detector: NudeDetector | None = None
+        self._lock = asyncio.Lock()
+
+    async def get_detector(self) -> NudeDetector:
+        """Get or initialize the NudeNet detector."""
+        async with self._lock:
+            if self._detector is None:
+                # Initialize detector in a thread to avoid blocking
+                self._detector = await asyncio.to_thread(self._create_detector)
+            return self._detector
+
+    def _create_detector(self) -> NudeDetector:
+        """Create and return a NudeDetector instance."""
+        print("Initializing NudeNet detector...")
+        detector = NudeDetector()
+        print("NudeNet detector initialized successfully")
+        return detector
+
+    async def detect(self, image_path: str) -> list[dict]:
+        """
+        Detect nudity in an image.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            List of detections, each containing:
+            - class: The body part class (e.g., "FEMALE_BREAST_EXPOSED")
+            - score: Confidence score (0.0 to 1.0)
+            - box: Bounding box [x, y, width, height]
+        """
+        detector = await self.get_detector()
+        return await asyncio.to_thread(detector.detect, image_path)
+
+    async def censor_image(
+        self,
+        image_bytes: bytes,
+        classes: list[str] | None = None,
+        threshold: float = CENSOR_THRESHOLD,
+    ) -> tuple[bytes, list[dict]]:
+        """
+        Detect and censor nudity in an image.
+
+        Args:
+            image_bytes: Raw image bytes
+            classes: List of body part classes to censor (uses CENSOR_CLASSES if None)
+            threshold: Minimum confidence score for detection
+
+        Returns:
+            Tuple of (censored_image_bytes, detections_list)
+        """
+        detector = await self.get_detector()
+        classes_to_censor = classes or CENSOR_CLASSES
+
+        # NudeNet requires a file path, so we use temp files
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp_in:
+            tmp_in.write(image_bytes)
+            tmp_in_path = tmp_in.name
+
+        try:
+            # Detect nudity
+            detections = await asyncio.to_thread(detector.detect, tmp_in_path)
+
+            # Filter detections by class and threshold
+            filtered_detections = [
+                d for d in detections
+                if d["class"] in classes_to_censor and d["score"] >= threshold
+            ]
+
+            if not filtered_detections:
+                # No nudity detected that needs censoring
+                return image_bytes, detections
+
+            # Apply black boxes using Pillow for more control
+            censored_bytes = await asyncio.to_thread(
+                self._apply_black_boxes,
+                image_bytes,
+                filtered_detections
+            )
+
+            return censored_bytes, detections
+
+        finally:
+            # Clean up temp file
+            try:
+                Path(tmp_in_path).unlink()
+            except Exception:
+                pass
+
+    def _apply_black_boxes(self, image_bytes: bytes, detections: list[dict]) -> bytes:
+        """
+        Apply black boxes over detected regions.
+
+        Args:
+            image_bytes: Raw image bytes
+            detections: List of detections with bounding boxes
+
+        Returns:
+            Censored image bytes
+        """
+        img = Image.open(io.BytesIO(image_bytes))
+
+        # Convert to RGB if necessary
+        if img.mode in ('RGBA', 'P'):
+            background = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+            img = background
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+
+        draw = ImageDraw.Draw(img)
+
+        for detection in detections:
+            box = detection["box"]
+            # NudeNet returns [x, y, width, height]
+            x, y, w, h = box
+            # Draw black rectangle
+            draw.rectangle([x, y, x + w, y + h], fill=(0, 0, 0))
+
+        # Save to bytes
+        output = io.BytesIO()
+        img.save(output, format='JPEG', quality=85)
+        return output.getvalue()
+
+
+# Global NudeNet censor instance
+nudenet_censor = NudeNetCensor()
+
 
 # =============================================================================
 # Database Setup
@@ -76,6 +240,7 @@ async def init_db():
                 gif_id TEXT PRIMARY KEY,
                 processed_path TEXT,
                 original_type TEXT,
+                detections TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
@@ -190,47 +355,20 @@ redgifs_client = RedGifsClient()
 
 
 # =============================================================================
-# Image Processing
+# Image Processing (with NudeNet censoring)
 # =============================================================================
 
-def process_image(image_bytes: bytes, text: str = "Hello") -> bytes:
-    """Process an image by adding text overlay."""
-    img = Image.open(io.BytesIO(image_bytes))
+async def process_image(image_bytes: bytes) -> tuple[bytes, list[dict]]:
+    """
+    Process an image by detecting and censoring nudity.
 
-    if img.mode in ('RGBA', 'P'):
-        background = Image.new('RGB', img.size, (255, 255, 255))
-        if img.mode == 'P':
-            img = img.convert('RGBA')
-        background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-        img = background
-    elif img.mode != 'RGB':
-        img = img.convert('RGB')
+    Args:
+        image_bytes: Raw image bytes
 
-    draw = ImageDraw.Draw(img)
-    font_size = max(20, img.width // 15)
-
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", font_size)
-    except (IOError, OSError):
-        try:
-            font = ImageFont.truetype("arial.ttf", font_size)
-        except (IOError, OSError):
-            font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    text_width = bbox[2] - bbox[0]
-    text_height = bbox[3] - bbox[1]
-    x = (img.width - text_width) // 2
-    y = img.height - text_height - 20
-
-    # Shadow
-    for dx, dy in [(-2, -2), (-2, 2), (2, -2), (2, 2)]:
-        draw.text((x + dx, y + dy), text, font=font, fill=(0, 0, 0))
-    draw.text((x, y), text, font=font, fill=(255, 255, 255))
-
-    output = io.BytesIO()
-    img.save(output, format='JPEG', quality=85)
-    return output.getvalue()
+    Returns:
+        Tuple of (processed_image_bytes, detections)
+    """
+    return await nudenet_censor.censor_image(image_bytes)
 
 
 # =============================================================================
@@ -297,15 +435,15 @@ async def get_processed_media_path(gif_id: str) -> str | None:
     return None
 
 
-async def cache_processed_media(gif_id: str, processed_bytes: bytes) -> str:
+async def cache_processed_media(gif_id: str, processed_bytes: bytes, detections: list[dict]) -> str:
     filename = f"{hashlib.md5(gif_id.encode()).hexdigest()}.jpg"
     filepath = MEDIA_CACHE_DIR / filename
     await asyncio.to_thread(filepath.write_bytes, processed_bytes)
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("""
-            INSERT OR REPLACE INTO processed_media (gif_id, processed_path, original_type)
-            VALUES (?, ?, ?)
-        """, (gif_id, str(filepath), "image/jpeg"))
+            INSERT OR REPLACE INTO processed_media (gif_id, processed_path, original_type, detections)
+            VALUES (?, ?, ?, ?)
+        """, (gif_id, str(filepath), "image/jpeg", json.dumps(detections)))
         await db.commit()
     return str(filepath)
 
@@ -465,6 +603,10 @@ class SuperBrowserBot(fp.PoeBot):
 
 - `help` - Show this help message
 
+**Features:**
+- 🔒 Automated nudity censoring using AI detection
+- 📦 Cached and processed images served from `/media/{id}`
+
 **For Canvas Apps:**
 Responses are returned as JSON in code blocks for easy parsing.
 """
@@ -473,7 +615,7 @@ Responses are returned as JSON in code blocks for easy parsing.
         """Return bot settings."""
         return fp.SettingsResponse(
             server_bot_dependencies={},
-            introduction_message="Welcome to Super Browser! 🌐\n\nUse `browse <tag>` to search for content, or type `help` for more commands.",
+            introduction_message="Welcome to Super Browser! 🌐\n\nUse `browse <tag>` to search for content, or type `help` for more commands.\n\n🔒 All images are processed with automated nudity censoring.",
         )
 
 
@@ -484,6 +626,10 @@ Responses are returned as JSON in code blocks for easy parsing.
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await init_db()
+    # Pre-initialize NudeNet detector on startup
+    print("Pre-loading NudeNet detector...")
+    await nudenet_censor.get_detector()
+    print("NudeNet detector ready!")
     yield
     await redgifs_client.close()
 
@@ -514,6 +660,10 @@ original_lifespan = app.router.lifespan_context
 @asynccontextmanager
 async def combined_lifespan(app: FastAPI):
     await init_db()
+    # Pre-initialize NudeNet detector on startup
+    print("Pre-loading NudeNet detector...")
+    await nudenet_censor.get_detector()
+    print("NudeNet detector ready!")
     async with original_lifespan(app):
         yield
     await redgifs_client.close()
@@ -528,13 +678,21 @@ app.router.lifespan_context = combined_lifespan
 @app.get("/")
 async def root():
     """Health check."""
-    return {"status": "ok", "service": "Super Browser Bot"}
+    return {
+        "status": "ok",
+        "service": "Super Browser Bot",
+        "features": {
+            "nudity_censoring": True,
+            "censor_threshold": CENSOR_THRESHOLD,
+            "censor_classes": CENSOR_CLASSES,
+        }
+    }
 
 
 @app.get("/media/{gif_id}")
-async def get_processed_media(gif_id: str, overlay_text: str = "Hello"):
+async def get_processed_media(gif_id: str):
     """
-    Serve processed media with overlay.
+    Serve processed media with nudity censored.
     This endpoint is called directly by the Canvas app to load images.
     """
     # Check cache
@@ -542,21 +700,39 @@ async def get_processed_media(gif_id: str, overlay_text: str = "Hello"):
     if cached_path:
         return FileResponse(cached_path, media_type="image/jpeg")
 
-    # Download and process
+    # Download original
     try:
         original_bytes, _ = await redgifs_client.download_media(gif_id)
     except Exception as e:
         return Response(content=f"Error downloading: {e}", status_code=404)
 
+    # Process with nudity censoring
     try:
-        processed_bytes = await asyncio.to_thread(process_image, original_bytes, overlay_text)
+        processed_bytes, detections = await process_image(original_bytes)
     except Exception as e:
         return Response(content=f"Error processing: {e}", status_code=500)
 
-    # Cache
-    filepath = await cache_processed_media(gif_id, processed_bytes)
+    # Cache the result
+    filepath = await cache_processed_media(gif_id, processed_bytes, detections)
 
     return FileResponse(filepath, media_type="image/jpeg")
+
+
+@app.get("/media/{gif_id}/detections")
+async def get_media_detections(gif_id: str):
+    """
+    Get detection results for a processed media item.
+    Returns the list of detected body parts and their bounding boxes.
+    """
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute(
+            "SELECT detections FROM processed_media WHERE gif_id = ?", (gif_id,)
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            return {"gif_id": gif_id, "detections": json.loads(row[0])}
+
+    return {"gif_id": gif_id, "detections": None, "message": "Not processed yet"}
 
 
 # =============================================================================

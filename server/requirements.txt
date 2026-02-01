@@ -22,3 +22,7 @@ python-dotenv>=1.0.0
 
 # SSE support
 sse-starlette==1.8.2
+
+# Nudity detection and censoring
+nudenet>=3.4.0
+onnxruntime>=1.18.0
