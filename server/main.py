@@ -27,7 +27,7 @@ from fastapi.responses import FileResponse
 from starlette.middleware.cors import CORSMiddleware
 
 import redgifs
-from redgifs import Order
+from redgifs import Order, Tags
 
 load_dotenv()
 
@@ -726,18 +726,21 @@ class RedGifsClient:
 
         order_enum = order_map.get(order.lower(), Order.TRENDING)
 
-        # Use search_gifs for tag-based searching
-        # This searches specifically by tags rather than general text
+        # Try using Tags object for proper tag-based search
+        # According to docs: search_text can be "a string or an instance of Tags"
         try:
+            # Create a Tags instance with the query as a tag
+            tags_obj = Tags(query)
             result = await asyncio.to_thread(
-                api.search_gifs,
-                tags=[query],  # Pass as list of tags
+                api.search,
+                tags_obj,
                 order=order_enum,
                 count=count,
                 page=page
             )
-        except (AttributeError, TypeError):
-            # Fallback to regular search if search_gifs doesn't exist or fails
+        except (TypeError, ValueError) as e:
+            # Fallback to regular string search if Tags doesn't work
+            print(f"Tags search failed ({e}), falling back to text search")
             result = await asyncio.to_thread(
                 api.search,
                 query,
