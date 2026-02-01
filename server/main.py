@@ -42,15 +42,44 @@ POE_ACCESS_KEY = os.getenv("POE_ACCESS_KEY", "")
 BOT_NAME = os.getenv("BOT_NAME", "SuperBrowser")
 SERVER_URL = os.getenv("SERVER_URL", "")
 
-# NudeNet model URL (320n is the default lightweight model)
-NUDENET_MODEL_URL = "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.onnx"
-NUDENET_MODEL_PATH = MODEL_CACHE_DIR / "320n.onnx"
+# NudeNet model URLs - try multiple sources
+# The vladmandic/nudenet repo hosts a compatible model (~12MB)
+NUDENET_MODEL_URLS = [
+    "https://huggingface.co/vladmandic/nudenet/resolve/main/nudenet.onnx",
+    # Fallback to GitHub releases
+    "https://github.com/notAI-tech/NudeNet/releases/download/v3.4-weights/320n.onnx",
+]
+NUDENET_MODEL_PATH = MODEL_CACHE_DIR / "nudenet.onnx"
+NUDENET_MODEL_MIN_SIZE = 5 * 1024 * 1024  # Expect at least 5MB (320n is ~6MB, vladmandic is ~12MB)
 
 # Nudity censoring configuration
 CENSOR_THRESHOLD = float(os.getenv("CENSOR_THRESHOLD", "0.4"))
 
-# NudeNet class labels (order matters - matches model output indices)
-NUDENET_LABELS = [
+# NudeNet class labels - supports both vladmandic and official 320n models
+# The vladmandic model uses slightly different naming
+NUDENET_LABELS_VLADMANDIC = [
+    "female-private-area",   # 0 - covered
+    "female-face",           # 1
+    "buttocks-bare",         # 2 - NSFW
+    "female-breast-bare",    # 3 - NSFW
+    "female-vagina",         # 4 - NSFW
+    "male-breast-bare",      # 5
+    "anus-bare",             # 6 - NSFW
+    "feet-bare",             # 7
+    "belly",                 # 8 - covered
+    "feet",                  # 9 - covered
+    "armpits",               # 10 - covered
+    "armpits-bare",          # 11
+    "male-face",             # 12
+    "belly-bare",            # 13
+    "male-penis",            # 14 - NSFW
+    "anus-area",             # 15 - covered
+    "female-breast",         # 16 - covered
+    "buttocks",              # 17 - covered
+]
+
+# Official NudeNet 320n model labels
+NUDENET_LABELS_320N = [
     "FEMALE_GENITALIA_COVERED",
     "FACE_FEMALE",
     "BUTTOCKS_EXPOSED",
@@ -71,14 +100,22 @@ NUDENET_LABELS = [
     "BUTTOCKS_COVERED",
 ]
 
-# Body parts to censor (exposed parts only by default)
+# Unified set of NSFW classes to censor (covers both naming conventions)
 DEFAULT_CENSOR_CLASSES = [
-    "FEMALE_BREAST_EXPOSED",
-    "MALE_BREAST_EXPOSED",
-    "FEMALE_GENITALIA_EXPOSED",
-    "MALE_GENITALIA_EXPOSED",
+    # vladmandic naming
+    "buttocks-bare",
+    "female-breast-bare",
+    "female-vagina",
+    "anus-bare",
+    "male-penis",
+    "male-breast-bare",
+    # Official 320n naming
     "BUTTOCKS_EXPOSED",
+    "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED",
     "ANUS_EXPOSED",
+    "MALE_GENITALIA_EXPOSED",
+    "MALE_BREAST_EXPOSED",
 ]
 
 CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
@@ -103,19 +140,59 @@ class NudeDetectorONNX:
         self.model_path = model_path
         self.input_size = input_size
         self.session: ort.InferenceSession | None = None
+        self.labels: list[str] = NUDENET_LABELS_VLADMANDIC  # Default, updated on load
         self._lock = asyncio.Lock()
 
     async def ensure_model_downloaded(self):
-        """Download the ONNX model if not present."""
+        """Download the ONNX model if not present or corrupted."""
+        # Check if model exists and is valid size
         if self.model_path.exists():
-            return
+            file_size = self.model_path.stat().st_size
+            if file_size >= NUDENET_MODEL_MIN_SIZE:
+                print(f"Model already exists: {file_size / 1024 / 1024:.1f} MB")
+                return
+            else:
+                print(f"Model file too small ({file_size} bytes), re-downloading...")
+                self.model_path.unlink()
 
-        print(f"Downloading NudeNet model to {self.model_path}...")
-        async with httpx.AsyncClient(timeout=120.0, follow_redirects=True) as client:
-            response = await client.get(NUDENET_MODEL_URL)
+        # Try each URL until one works
+        last_error = None
+        for url in NUDENET_MODEL_URLS:
+            try:
+                print(f"Downloading NudeNet model from {url}...")
+                await self._download_model(url)
+                print(f"Model downloaded successfully: {self.model_path.stat().st_size / 1024 / 1024:.1f} MB")
+                return
+            except Exception as e:
+                print(f"Failed to download from {url}: {e}")
+                last_error = e
+                # Clean up partial download
+                if self.model_path.exists():
+                    self.model_path.unlink()
+
+        raise RuntimeError(f"Failed to download model from any source. Last error: {last_error}")
+
+    async def _download_model(self, url: str):
+        """Download model from a specific URL."""
+        async with httpx.AsyncClient(timeout=300.0, follow_redirects=True) as client:
+            response = await client.get(url)
             response.raise_for_status()
-            self.model_path.write_bytes(response.content)
-        print(f"Model downloaded: {self.model_path.stat().st_size / 1024 / 1024:.1f} MB")
+
+            content = response.content
+            content_size = len(content)
+
+            # Verify we got actual model data, not an HTML error page
+            if content_size < NUDENET_MODEL_MIN_SIZE:
+                raise RuntimeError(
+                    f"Downloaded file too small ({content_size} bytes). "
+                    f"Expected at least {NUDENET_MODEL_MIN_SIZE} bytes."
+                )
+
+            # Check it's not HTML
+            if content[:100].lower().find(b'<!doctype') >= 0 or content[:100].lower().find(b'<html') >= 0:
+                raise RuntimeError("Downloaded HTML instead of ONNX model file")
+
+            self.model_path.write_bytes(content)
 
     async def load(self):
         """Load the ONNX model."""
@@ -132,7 +209,27 @@ class NudeDetectorONNX:
                 str(self.model_path),
                 providers=["CPUExecutionProvider"]
             )
-            print("NudeNet model loaded successfully")
+
+            # Detect model type based on output shape
+            # vladmandic model vs official 320n model
+            output_shape = self.session.get_outputs()[0].shape
+            print(f"Model output shape: {output_shape}")
+
+            # Determine input size from model
+            input_shape = self.session.get_inputs()[0].shape
+            print(f"Model input shape: {input_shape}")
+
+            # Both models should have 18 classes, but file size differs
+            # vladmandic is ~12MB, 320n is ~6MB
+            file_size = self.model_path.stat().st_size
+            if file_size > 10 * 1024 * 1024:  # > 10MB = vladmandic
+                self.labels = NUDENET_LABELS_VLADMANDIC
+                print("Detected vladmandic/nudenet model")
+            else:
+                self.labels = NUDENET_LABELS_320N
+                print("Detected official NudeNet 320n model")
+
+            print(f"NudeNet model loaded successfully with {len(self.labels)} classes")
 
     def _preprocess(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[float, float]]:
         """
@@ -218,7 +315,7 @@ class NudeDetectorONNX:
             y1 = max(0, y1)
 
             detections.append({
-                "class": NUDENET_LABELS[class_id] if class_id < len(NUDENET_LABELS) else f"CLASS_{class_id}",
+                "class": self.labels[class_id] if class_id < len(self.labels) else f"CLASS_{class_id}",
                 "score": round(score, 4),
                 "box": [int(x1), int(y1), int(box_w), int(box_h)]
             })
