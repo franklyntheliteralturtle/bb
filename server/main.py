@@ -252,7 +252,10 @@ class NudeDetectorONNX:
         # Convert to numpy array and normalize to 0-1
         img_array = np.array(resized, dtype=np.float32) / 255.0
 
-        # Add batch dimension: (1, 320, 320, 3)
+        # Transpose from HWC to CHW format (height, width, channels -> channels, height, width)
+        img_array = np.transpose(img_array, (2, 0, 1))
+
+        # Add batch dimension: (1, 3, 320, 320) - NCHW format
         input_tensor = np.expand_dims(img_array, axis=0)
 
         # Calculate scale factors to map detections back to original size
