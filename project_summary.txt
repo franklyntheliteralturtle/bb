@@ -2,60 +2,138 @@
 
 ### What It Is
 A Poe Canvas App system for browsing Rule34.xxx content with **automated server-side nudity censorship**. The architecture consists of:
-- **Canvas App** (frontend) - HTML/CSS/JS running in Poe's iframe
+- **Canvas App** (frontend) - HTML/CSS/JS running in Poe's iframe (NOT YET BUILT)
 - **Railway Server** (backend) - FastAPI with Poe Protocol, hosting a bot called "SuperBrowser"
 
-### Core Features Implemented
-1. **Rule34.xxx Integration** - Direct API access for tags and posts
-2. **Dual-Model Nudity Detection** - Uses two NudeNet ONNX models (320n and 640m) running in parallel for better coverage
-3. **Direct ONNX Inference** - No OpenCV dependency (Railway doesn't have X11 libraries). Uses only `onnxruntime`, `numpy`, and `Pillow`
-4. **Black Box Censoring** - Detected NSFW regions get black rectangles drawn over them
-5. **Video/GIF Processing** - FFmpeg-based frame extraction, per-frame censoring, and reassembly
+### Current State
+The backend is fully functional. The canvas app frontend has NOT been created yet.
 
-### Key Technical Decisions
-- **No OpenCV**: Direct ONNX inference with manual preprocessing (NCHW format, normalization) and postprocessing (YOLO output parsing, NMS)
-- **Dual label support**: vladmandic model uses different class names than official NudeNet - code detects model type by file size
-- **Rule34 over RedGifs**: Better tag search support, image-focused, working API
+---
 
-### Rule34 API Endpoints Used
-- **Tags**: `https://api.rule34.xxx/index.php?page=dapi&s=tag&q=index&json=1`
-  - `orderby=updated` for trending, `orderby=count` for popular
-- **Posts**: `https://api.rule34.xxx/index.php?page=dapi&s=post&q=index&json=1&tags={tag}`
-  - Add `sort:score` to tags for highest rated
-- **Autocomplete**: `https://autocomplete.rule34.xxx/autocomplete.php?q={query}`
+## Architecture
 
-### Database Schema (SQLite)
-- `post_cache` - Rule34 post metadata (id, tags, file_url, sample_url, width, height, file_type, score)
-- `processed_media` - Paths to censored images/videos + detection results
-- `captions` - Stored captions for posts
+### Backend Components
 
-### REST Endpoints
-- `GET /health` - Health check
-- `GET /tags/popular` - Get trending/popular tags (cached for 5 min)
-  - `?limit=50` - Number of tags
-  - `?order_by=updated|count` - Sort order
-- `GET /tags/autocomplete` - Tag autocomplete
-  - `?q=search_term` - Search query
-- `GET /posts` - Get posts for tag(s)
-  - `?tags=tag1 tag2` - Space-separated tags
-  - `?limit=50` - Number of posts
-  - `?page=0` - Pagination
-  - `?sort=score|id` - Sort by rating or recency
-- `GET /posts/{post_id}` - Get single post
-- `GET /media/{post_id}` - Serve censored media (processes on first request)
-- `GET /media/{post_id}/status` - Check if media is already processed
+1. **Rule34Client** - Handles all Rule34.xxx API interactions
+   - Tag fetching (with XML parsing fallback since API returns XML despite json=1 param)
+   - Post search with filtering
+   - Multi-page fetching to fill results after filtering
+   - Authentication via api_key and user_id
 
-### Poe Bot Commands
-- `/tags` - View trending tags
-- `/search <tag>` - Search posts by tag
+2. **NudeDetectorONNX** - Direct ONNX inference for nudity detection
+   - Two models: 320n (fast, 6MB) and 640m (accurate, 25MB)
+   - Both run in parallel for best coverage
+   - Manual preprocessing (no OpenCV dependency)
+   - YOLO-style output parsing with NMS
 
-### Files
-- `main.py` - The complete FastAPI server with Poe bot
-- `requirements.txt` - Dependencies (no OpenCV, no RedGifs!)
+3. **NudeNetCensor** - Wrapper that combines detection + censoring
+   - Always uses both models
+   - Black box censoring over detected regions
+
+4. **MediaProcessor** - Orchestrates the censoring pipeline
+   - Downloads original from Rule34
+   - Runs dual-model censoring
+   - Caches processed images to disk
+   - Only processes images (no video/GIF support currently)
+
+### Content Filtering
+Posts are filtered before being returned:
+- **File type**: Only images (no videos, no GIFs)
+- **Aspect ratio**: Height/width between 0.4 and 2.5 (filters comic panels)
+- Multi-page fetching: Fetches up to 5 API pages (500 raw posts) to fill filtered results
+
+---
+
+## REST API Endpoints
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Health check |
+| `GET /tags/popular` | Returns hardcoded popular tags list |
+| `GET /tags/autocomplete?q=xxx` | Tag autocomplete from Rule34 |
+| `GET /posts?tags=xxx&page=0&limit=50&sort=score` | Get filtered posts |
+| `GET /posts/{post_id}` | Get single post metadata |
+| `GET /media/{post_id}` | Get censored image (displays in browser) |
+| `GET /media/{post_id}/status` | Check if image is already processed |
+
+### Poe Bot Commands (minimal, semi-private)
+- `/tags` - Shows hardcoded popular tags
+- `/search <tag> [page]` - Search with pagination
+
+---
+
+## Database Schema (SQLite)
+
+```sql
+-- Post metadata cache
+CREATE TABLE post_cache (
+    post_id INTEGER PRIMARY KEY,
+    tags TEXT,
+    file_url TEXT,
+    sample_url TEXT,
+    preview_url TEXT,
+    width INTEGER,
+    height INTEGER,
+    file_type TEXT,
+    score INTEGER,
+    source TEXT,
+    cached_at TIMESTAMP
+);
+
+-- Processed (censored) media cache
+CREATE TABLE processed_media (
+    id TEXT PRIMARY KEY,           -- Format: "r34_{post_id}"
+    post_id INTEGER,
+    media_type TEXT,               -- Always "image" currently
+    file_path TEXT,                -- Path to censored file
+    detections TEXT,               -- JSON array of detections
+    processed_at TIMESTAMP
+);
+
+-- Captions cache (for future use)
+CREATE TABLE captions (
+    id TEXT PRIMARY KEY,
+    post_id INTEGER,
+    caption TEXT,
+    style TEXT,
+    created_at TIMESTAMP
+);
+```
+
+---
+
+## Configuration (Environment Variables)
+
+### Required
+- `POE_ACCESS_KEY` - Poe API access key
+- `RULE34_API_KEY` - Rule34 API key
+- `RULE34_USER_ID` - Rule34 user ID
+- `SERVER_URL` - Public URL of server (for generating media URLs)
+
+### Optional
+- `DATABASE_PATH` - SQLite path (default: `cache.db`)
+- `MEDIA_CACHE_DIR` - Censored images directory (default: `media_cache`)
+- `MODEL_CACHE_DIR` - ONNX models directory (default: `models`)
+- `CENSOR_THRESHOLD` - Detection confidence (default: `0.4`)
+- `MAX_ASPECT_RATIO` - Max height/width ratio (default: `2.5`)
+- `MIN_ASPECT_RATIO` - Min height/width ratio (default: `0.4`)
+- `MAX_FETCH_PAGES` - API pages to fetch per logical page (default: `5`)
+- `RULE34_TAG_CACHE_TTL` - Tag cache TTL in seconds (default: `300`)
+
+---
+
+## Files
+
+- `main.py` - Complete FastAPI server with Poe bot
+- `requirements.txt` - Python dependencies
 - `railway.toml` - Railway deployment config
-- `Procfile` - Process file for deployment
+- `Procfile` - Process file
+- `video_gif_processing_reference.md` - Extracted video/GIF code for future re-implementation
 
-### Dependencies (requirements.txt)
+---
+
+## Dependencies
+
 ```
 fastapi-poe==0.0.48
 fastapi==0.109.2
@@ -69,34 +147,47 @@ onnxruntime>=1.18.0
 numpy>=1.24.0
 ```
 
-### Environment Variables
-- `DATABASE_PATH` - SQLite database path (default: `cache.db`)
-- `MEDIA_CACHE_DIR` - Where to store processed images (default: `media_cache`)
-- `VIDEO_CACHE_DIR` - Where to store processed videos (default: `video_cache`)
-- `MODEL_CACHE_DIR` - Where to store ONNX models (default: `models`)
-- `POE_ACCESS_KEY` - Poe API access key
-- `BOT_NAME` - Bot name (default: `SuperBrowser`)
-- `SERVER_URL` - Public URL of the server (for generating media URLs)
-- `CENSOR_THRESHOLD` - Detection confidence threshold (default: `0.4`)
-- `RULE34_TAG_CACHE_TTL` - How long to cache tag results in seconds (default: `300` = 5 min)
-
-### Video Processing Settings
-- `VIDEO_MAX_DURATION` - Max video length in seconds (default: `60`)
-- `VIDEO_TARGET_FPS` - Target FPS for processing (default: `15`)
-- `VIDEO_BATCH_SIZE` - Frames to process in parallel (default: `20`)
-- `VIDEO_USE_DUAL_MODELS` - Use both models for video (default: `false`)
-- `VIDEO_PRIMARY_MODEL` - Which model to use: `320n` or `640m` (default: `320n`)
+No OpenCV! Uses direct ONNX inference with Pillow for image processing.
 
 ---
 
-### Canvas App User Experience (Planned)
-1. **Main Page**: User sees list of trending tags from Rule34
-2. **Tag Selection**: User picks a tag (from list or via autocomplete search)
-3. **Browse View**: Grid of uncensored thumbnails (sample_url from Rule34)
-4. **Detail View**: Click thumbnail to see full censored image/video with caption
+## Canvas App Requirements (TO BE BUILT)
 
-### Instructions for Future Instance
-1. **When outputting modified files**: Use the `mcp__attachments__output` tool and specify just the filename (e.g., `["main.py"]`), not the full path with `mnt/`
-2. The backend code is in `mnt/main.py` on the working directory
-3. The Canvas App frontend (`index.html`) has not been created yet
-4. Thumbnails load directly from Rule34 CDN (uncensored) - only full images go through our censoring pipeline
+### User Flow
+1. **Main Page**: User sees list of popular tags (hardcoded)
+2. **Tag Selection**: User picks a tag or uses autocomplete search
+3. **Browse View**: Grid of uncensored thumbnails (from Rule34's `sample_url`)
+4. **Detail View**: Click thumbnail → see full censored image with caption
+
+### Technical Notes
+- Thumbnails load directly from Rule34 CDN (uncensored)
+- Only full images go through our censoring pipeline
+- `/media/{post_id}` returns JPEG that displays inline in browser
+- Infinite scroll: Increment `page` parameter in `/posts` calls
+- Each page returns up to 20-50 filtered results
+
+### Canvas Constraints
+- No localStorage/sessionStorage
+- No alert/confirm/prompt
+- Support light/dark mode
+- Mobile-responsive (16px min input font)
+- Use allowed CDNs only (see Poe iframe CSP)
+
+---
+
+## Future Work
+
+1. **Build Canvas App** - The frontend browsing experience
+2. **Caption Generation** - Use LLM to generate captions for images
+3. **Re-enable GIF Support** - Code preserved in `video_gif_processing_reference.md`
+4. **More Tags** - Expand `POPULAR_TAGS` list or implement better tag discovery
+
+---
+
+## Key Technical Decisions
+
+1. **No OpenCV**: Railway doesn't have X11 libraries, so we use direct ONNX inference with manual NCHW preprocessing
+2. **Dual Models**: Always run both 320n and 640m for best detection coverage
+3. **XML Parsing**: Rule34 API returns XML despite json=1 when authenticated
+4. **Multi-page Fetching**: Since ~90%+ of posts are filtered out, we fetch multiple API pages to fill results
+5. **Images Only**: Videos and GIFs disabled to avoid processing complexity and large file issues

@@ -1307,27 +1307,13 @@ class SuperBrowserBot(fp.PoeBot):
             yield fp.PartialResponse(text=response)
 
         else:
-            yield fp.PartialResponse(text="""
-## Super Browser
-
-Commands:
-- `/tags` - View popular tags
-- `/search <tag>` - Search posts by tag (page 0)
-- `/search <tag> <page>` - Search with pagination
-
-**REST API Endpoints:**
-- `GET /tags/popular` - Get popular tags
-- `GET /posts?tags=<tag>&page=0&limit=50` - Get posts (paginated)
-- `GET /media/<post_id>` - Get censored image
-
-Use the canvas app for the full browsing experience!
-            """)
+            yield fp.PartialResponse(text="Wait for the app to be done silly. This one needs to be public so the app can use it during testing.")
 
     async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
         """Return bot settings."""
         return fp.SettingsResponse(
             server_bot_dependencies={},
-            introduction_message="Welcome to Super Browser! Use /tags to see trending content.",
+            introduction_message="Ready.",
         )
 
 
