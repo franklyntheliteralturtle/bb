@@ -13,6 +13,7 @@ import tempfile
 import subprocess
 import shutil
 import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import AsyncIterable
 from contextlib import asynccontextmanager
@@ -183,39 +184,42 @@ class Rule34Client:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
             response.raise_for_status()
 
-            # Log raw response for debugging
             raw_text = response.text
-            print(f"[Rule34] Tags response length: {len(raw_text)}, first 200 chars: {raw_text[:200]}")
+            print(f"[Rule34] Tags response length: {len(raw_text)}")
 
             # Handle empty response
             if not raw_text or raw_text.strip() == "":
                 print("[Rule34] Empty response from tags API")
                 return []
 
-            # Rule34 API returns JSON array directly
-            try:
-                tags = response.json()
-            except Exception as json_err:
-                print(f"[Rule34] JSON parse error: {json_err}")
-                print(f"[Rule34] Raw response: {raw_text[:500]}")
-                return []
-
-            if not isinstance(tags, list):
-                print(f"[Rule34] Unexpected response format: {type(tags)}, value: {str(tags)[:200]}")
-                return []
-
-            # Normalize tag data
+            # Try to parse response - could be JSON or XML
             result = []
-            for tag in tags:
-                result.append({
-                    "name": tag.get("name", ""),
-                    "count": int(tag.get("count", 0)),
-                    "type": self._tag_type_name(tag.get("type", 0)),
-                })
+
+            # Check if it's XML (starts with <?xml or <tags)
+            if raw_text.strip().startswith("<?xml") or raw_text.strip().startswith("<tags"):
+                print("[Rule34] Parsing XML response for tags")
+                result = self._parse_tags_xml(raw_text)
+            else:
+                # Try JSON parsing
+                try:
+                    tags = response.json()
+                    if isinstance(tags, list):
+                        for tag in tags:
+                            result.append({
+                                "name": tag.get("name", ""),
+                                "count": int(tag.get("count", 0)),
+                                "type": self._tag_type_name(int(tag.get("type", 0))),
+                            })
+                    else:
+                        print(f"[Rule34] Unexpected JSON format: {type(tags)}")
+                except Exception as json_err:
+                    print(f"[Rule34] JSON parse error: {json_err}, trying XML")
+                    result = self._parse_tags_xml(raw_text)
 
             # Cache the result
-            async with self._tag_cache_lock:
-                self._tag_cache[cache_key] = (time.time(), result)
+            if result:
+                async with self._tag_cache_lock:
+                    self._tag_cache[cache_key] = (time.time(), result)
 
             print(f"[Rule34] Fetched {len(result)} tags")
             return result
@@ -236,6 +240,48 @@ class Rule34Client:
             5: "metadata",
         }
         return types.get(type_id, "general")
+
+    def _parse_tags_xml(self, xml_text: str) -> list[dict]:
+        """Parse XML response for tags."""
+        result = []
+        try:
+            root = ET.fromstring(xml_text)
+            for tag_elem in root.findall(".//tag"):
+                name = tag_elem.get("name", "")
+                count = int(tag_elem.get("count", 0))
+                type_id = int(tag_elem.get("type", 0))
+                if name:
+                    result.append({
+                        "name": name,
+                        "count": count,
+                        "type": self._tag_type_name(type_id),
+                    })
+        except ET.ParseError as e:
+            print(f"[Rule34] XML parse error for tags: {e}")
+        return result
+
+    def _parse_posts_xml(self, xml_text: str) -> list[dict]:
+        """Parse XML response for posts."""
+        result = []
+        try:
+            root = ET.fromstring(xml_text)
+            for post_elem in root.findall(".//post"):
+                file_url = post_elem.get("file_url", "")
+                result.append({
+                    "id": int(post_elem.get("id", 0)),
+                    "tags": post_elem.get("tags", ""),
+                    "file_url": file_url,
+                    "sample_url": post_elem.get("sample_url", "") or post_elem.get("preview_url", ""),
+                    "preview_url": post_elem.get("preview_url", ""),
+                    "width": int(post_elem.get("width", 0)),
+                    "height": int(post_elem.get("height", 0)),
+                    "score": int(post_elem.get("score", 0)),
+                    "file_type": self._determine_file_type(file_url),
+                    "source": post_elem.get("source", ""),
+                })
+        except ET.ParseError as e:
+            print(f"[Rule34] XML parse error for posts: {e}")
+        return result
 
     async def autocomplete_tags(self, query: str, limit: int = 20) -> list[dict]:
         """
@@ -334,41 +380,51 @@ class Rule34Client:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
             response.raise_for_status()
 
-            data = response.json()
+            raw_text = response.text
 
-            # API returns list of posts directly
-            if not isinstance(data, list):
-                print(f"[Rule34] Unexpected posts response: {type(data)}")
+            # Handle empty response
+            if not raw_text or raw_text.strip() == "":
+                print("[Rule34] Empty response from posts API")
                 return []
 
-            # Normalize post data
             posts = []
-            for post in data:
-                file_url = post.get("file_url", "")
-                sample_url = post.get("sample_url", "") or post.get("preview_url", "")
-                preview_url = post.get("preview_url", "")
 
-                # Determine file type from URL
-                file_type = self._determine_file_type(file_url)
-
-                posts.append({
-                    "id": int(post.get("id", 0)),
-                    "tags": post.get("tags", ""),
-                    "file_url": file_url,
-                    "sample_url": sample_url,
-                    "preview_url": preview_url,
-                    "width": int(post.get("width", 0)),
-                    "height": int(post.get("height", 0)),
-                    "score": int(post.get("score", 0)),
-                    "file_type": file_type,
-                    "source": post.get("source", ""),
-                })
+            # Check if it's XML
+            if raw_text.strip().startswith("<?xml") or raw_text.strip().startswith("<posts"):
+                print("[Rule34] Parsing XML response for posts")
+                posts = self._parse_posts_xml(raw_text)
+            else:
+                # Try JSON parsing
+                try:
+                    data = response.json()
+                    if isinstance(data, list):
+                        for post in data:
+                            file_url = post.get("file_url", "")
+                            posts.append({
+                                "id": int(post.get("id", 0)),
+                                "tags": post.get("tags", ""),
+                                "file_url": file_url,
+                                "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
+                                "preview_url": post.get("preview_url", ""),
+                                "width": int(post.get("width", 0)),
+                                "height": int(post.get("height", 0)),
+                                "score": int(post.get("score", 0)),
+                                "file_type": self._determine_file_type(file_url),
+                                "source": post.get("source", ""),
+                            })
+                    else:
+                        print(f"[Rule34] Unexpected JSON format for posts: {type(data)}")
+                except Exception as json_err:
+                    print(f"[Rule34] JSON parse error for posts: {json_err}, trying XML")
+                    posts = self._parse_posts_xml(raw_text)
 
             print(f"[Rule34] Fetched {len(posts)} posts for tags: {tags}")
             return posts
 
         except Exception as e:
             print(f"[Rule34] Error fetching posts: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def _determine_file_type(self, url: str) -> str:
@@ -395,23 +451,39 @@ class Rule34Client:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
             response.raise_for_status()
 
-            data = response.json()
+            raw_text = response.text
 
-            if isinstance(data, list) and len(data) > 0:
-                post = data[0]
-                file_url = post.get("file_url", "")
-                return {
-                    "id": int(post.get("id", 0)),
-                    "tags": post.get("tags", ""),
-                    "file_url": file_url,
-                    "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
-                    "preview_url": post.get("preview_url", ""),
-                    "width": int(post.get("width", 0)),
-                    "height": int(post.get("height", 0)),
-                    "score": int(post.get("score", 0)),
-                    "file_type": self._determine_file_type(file_url),
-                    "source": post.get("source", ""),
-                }
+            if not raw_text or raw_text.strip() == "":
+                return None
+
+            posts = []
+
+            # Check if it's XML
+            if raw_text.strip().startswith("<?xml") or raw_text.strip().startswith("<posts"):
+                posts = self._parse_posts_xml(raw_text)
+            else:
+                try:
+                    data = response.json()
+                    if isinstance(data, list) and len(data) > 0:
+                        post = data[0]
+                        file_url = post.get("file_url", "")
+                        return {
+                            "id": int(post.get("id", 0)),
+                            "tags": post.get("tags", ""),
+                            "file_url": file_url,
+                            "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
+                            "preview_url": post.get("preview_url", ""),
+                            "width": int(post.get("width", 0)),
+                            "height": int(post.get("height", 0)),
+                            "score": int(post.get("score", 0)),
+                            "file_type": self._determine_file_type(file_url),
+                            "source": post.get("source", ""),
+                        }
+                except Exception:
+                    posts = self._parse_posts_xml(raw_text)
+
+            if posts:
+                return posts[0]
 
             return None
 
