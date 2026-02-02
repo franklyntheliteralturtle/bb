@@ -174,11 +174,25 @@ class Rule34Client:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
             response.raise_for_status()
 
+            # Log raw response for debugging
+            raw_text = response.text
+            print(f"[Rule34] Tags response length: {len(raw_text)}, first 200 chars: {raw_text[:200]}")
+
+            # Handle empty response
+            if not raw_text or raw_text.strip() == "":
+                print("[Rule34] Empty response from tags API")
+                return []
+
             # Rule34 API returns JSON array directly
-            tags = response.json()
+            try:
+                tags = response.json()
+            except Exception as json_err:
+                print(f"[Rule34] JSON parse error: {json_err}")
+                print(f"[Rule34] Raw response: {raw_text[:500]}")
+                return []
 
             if not isinstance(tags, list):
-                print(f"[Rule34] Unexpected response format: {type(tags)}")
+                print(f"[Rule34] Unexpected response format: {type(tags)}, value: {str(tags)[:200]}")
                 return []
 
             # Normalize tag data
@@ -199,6 +213,8 @@ class Rule34Client:
 
         except Exception as e:
             print(f"[Rule34] Error fetching tags: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
     def _tag_type_name(self, type_id: int) -> str:
