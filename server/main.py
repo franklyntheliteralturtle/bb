@@ -59,6 +59,16 @@ POPULAR_TAGS = [
     "genshin_impact",
 ]
 
+# Content filtering settings
+# Only allow images (no videos or GIFs for now)
+ALLOWED_FILE_TYPES = ["image"]
+# Max aspect ratio (height/width) - filters out tall comic panels
+MAX_ASPECT_RATIO = float(os.getenv("MAX_ASPECT_RATIO", "2.5"))  # height can be at most 2.5x width
+# Min aspect ratio - filters out super wide images
+MIN_ASPECT_RATIO = float(os.getenv("MIN_ASPECT_RATIO", "0.4"))  # width can be at most 2.5x height
+# Max pages to fetch when trying to fill filtered results
+MAX_FETCH_PAGES = int(os.getenv("MAX_FETCH_PAGES", "5"))
+
 # NudeNet model URLs - using dual models for better coverage
 NUDENET_320N_URLS = [
     "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/320n.onnx",
@@ -356,12 +366,12 @@ class Rule34Client:
         sort: str = "score"
     ) -> list[dict]:
         """
-        Get posts matching given tags.
+        Get posts matching given tags with automatic multi-page fetching to fill filtered results.
 
         Args:
             tags: Space-separated tags (use sort:score for highest rated)
-            limit: Number of posts (max 1000)
-            page: Page number (0-indexed)
+            limit: Number of posts to return after filtering
+            page: Logical page number (0-indexed) - internally maps to API pages
             sort: "score" for highest rated, "id" for newest
 
         Returns:
@@ -374,66 +384,136 @@ class Rule34Client:
         elif sort == "id":
             search_tags = f"sort:id:desc {tags}"
 
-        params = self._add_auth_params({
-            "page": "dapi",
-            "s": "post",
-            "q": "index",
-            "json": "1",
-            "limit": min(limit, 1000),
-            "pid": page,
-            "tags": search_tags,
-        })
+        # We'll fetch multiple API pages to fill the requested limit after filtering
+        # Each API page fetches 100 posts
+        api_page_size = 100
+        # Calculate starting API page based on logical page
+        # Estimate: if ~10% of posts pass filter, we need ~10x pages
+        # For page N, skip N*limit filtered posts, which means ~N*limit*10 raw posts
+        start_api_page = page * MAX_FETCH_PAGES
 
-        try:
-            response = await self.http_client.get(RULE34_API_BASE, params=params)
-            response.raise_for_status()
+        filtered_posts = []
+        seen_ids = set()
+        total_fetched = 0
+        total_filtered_out = 0
 
-            raw_text = response.text
+        for api_page_offset in range(MAX_FETCH_PAGES):
+            current_api_page = start_api_page + api_page_offset
 
-            # Handle empty response
-            if not raw_text or raw_text.strip() == "":
-                print("[Rule34] Empty response from posts API")
-                return []
+            params = self._add_auth_params({
+                "page": "dapi",
+                "s": "post",
+                "q": "index",
+                "json": "1",
+                "limit": api_page_size,
+                "pid": current_api_page,
+                "tags": search_tags,
+            })
 
-            posts = []
+            try:
+                response = await self.http_client.get(RULE34_API_BASE, params=params)
+                response.raise_for_status()
 
-            # Check if it's XML
-            if raw_text.strip().startswith("<?xml") or raw_text.strip().startswith("<posts"):
-                print("[Rule34] Parsing XML response for posts")
-                posts = self._parse_posts_xml(raw_text)
-            else:
-                # Try JSON parsing
-                try:
-                    data = response.json()
-                    if isinstance(data, list):
-                        for post in data:
-                            file_url = post.get("file_url", "")
-                            posts.append({
-                                "id": int(post.get("id", 0)),
-                                "tags": post.get("tags", ""),
-                                "file_url": file_url,
-                                "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
-                                "preview_url": post.get("preview_url", ""),
-                                "width": int(post.get("width", 0)),
-                                "height": int(post.get("height", 0)),
-                                "score": int(post.get("score", 0)),
-                                "file_type": self._determine_file_type(file_url),
-                                "source": post.get("source", ""),
-                            })
-                    else:
-                        print(f"[Rule34] Unexpected JSON format for posts: {type(data)}")
-                except Exception as json_err:
-                    print(f"[Rule34] JSON parse error for posts: {json_err}, trying XML")
+                raw_text = response.text
+
+                if not raw_text or raw_text.strip() == "":
+                    print(f"[Rule34] Empty response at API page {current_api_page}, stopping")
+                    break
+
+                posts = []
+
+                if raw_text.strip().startswith("<?xml") or raw_text.strip().startswith("<posts"):
                     posts = self._parse_posts_xml(raw_text)
+                else:
+                    try:
+                        data = response.json()
+                        if isinstance(data, list):
+                            for post in data:
+                                file_url = post.get("file_url", "")
+                                posts.append({
+                                    "id": int(post.get("id", 0)),
+                                    "tags": post.get("tags", ""),
+                                    "file_url": file_url,
+                                    "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
+                                    "preview_url": post.get("preview_url", ""),
+                                    "width": int(post.get("width", 0)),
+                                    "height": int(post.get("height", 0)),
+                                    "score": int(post.get("score", 0)),
+                                    "file_type": self._determine_file_type(file_url),
+                                    "source": post.get("source", ""),
+                                })
+                    except Exception as json_err:
+                        print(f"[Rule34] JSON parse error: {json_err}, trying XML")
+                        posts = self._parse_posts_xml(raw_text)
 
-            print(f"[Rule34] Fetched {len(posts)} posts for tags: {tags}")
-            return posts
+                if not posts:
+                    print(f"[Rule34] No posts at API page {current_api_page}, stopping")
+                    break
 
-        except Exception as e:
-            print(f"[Rule34] Error fetching posts: {e}")
-            import traceback
-            traceback.print_exc()
-            return []
+                total_fetched += len(posts)
+
+                # Filter and dedupe
+                for post in posts:
+                    if post["id"] in seen_ids:
+                        continue
+                    seen_ids.add(post["id"])
+
+                    if self._passes_filter(post):
+                        filtered_posts.append(post)
+                    else:
+                        total_filtered_out += 1
+
+                    # Stop if we have enough
+                    if len(filtered_posts) >= limit:
+                        break
+
+                if len(filtered_posts) >= limit:
+                    break
+
+            except Exception as e:
+                print(f"[Rule34] Error fetching API page {current_api_page}: {e}")
+                break
+
+        print(f"[Rule34] Fetched {total_fetched} posts across {api_page_offset + 1} API pages for tags: {tags}")
+        print(f"[Rule34] After filtering: {len(filtered_posts)} posts (filtered out {total_filtered_out})")
+
+        return filtered_posts[:limit]
+
+    def _passes_filter(self, post: dict) -> bool:
+        """Check if a single post passes the content filters."""
+        # Check file type
+        if post.get("file_type") not in ALLOWED_FILE_TYPES:
+            return False
+
+        # Check aspect ratio (height/width)
+        width = post.get("width", 0)
+        height = post.get("height", 0)
+        if width > 0 and height > 0:
+            aspect_ratio = height / width
+            if aspect_ratio > MAX_ASPECT_RATIO or aspect_ratio < MIN_ASPECT_RATIO:
+                return False
+
+        return True
+
+    def _filter_posts(self, posts: list[dict]) -> list[dict]:
+        """Filter posts by file type and aspect ratio."""
+        filtered = []
+        for post in posts:
+            # Check file type
+            if post.get("file_type") not in ALLOWED_FILE_TYPES:
+                continue
+
+            # Check aspect ratio (height/width)
+            width = post.get("width", 0)
+            height = post.get("height", 0)
+            if width > 0 and height > 0:
+                aspect_ratio = height / width
+                if aspect_ratio > MAX_ASPECT_RATIO or aspect_ratio < MIN_ASPECT_RATIO:
+                    continue
+
+            filtered.append(post)
+
+        return filtered
 
     def _determine_file_type(self, url: str) -> str:
         """Determine file type from URL."""
