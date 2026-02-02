@@ -1,62 +1,65 @@
 ## Project Summary: Super Browser
 
 ### What It Is
-A Poe Canvas App system for browsing RedGifs content with **automated server-side nudity censorship**. The architecture consists of:
+A Poe Canvas App system for browsing Rule34.xxx content with **automated server-side nudity censorship**. The architecture consists of:
 - **Canvas App** (frontend) - HTML/CSS/JS running in Poe's iframe
 - **Railway Server** (backend) - FastAPI with Poe Protocol, hosting a bot called "SuperBrowser"
 
 ### Core Features Implemented
-1. **Dual-Model Nudity Detection** - Uses two NudeNet ONNX models (320n and 640m) running in parallel for better coverage
-2. **Direct ONNX Inference** - No OpenCV dependency (Railway doesn't have X11 libraries). Uses only `onnxruntime`, `numpy`, and `Pillow`
-3. **Black Box Censoring** - Detected NSFW regions get black rectangles drawn over them
-4. **Local Tag Filtering** - RedGifs search API is broken, so we:
-   - Fetch content from **trending only**
-   - Cache everything locally with SQLite
-   - Build a tag index from cached content
-   - Filter by tags from the local cache
+1. **Rule34.xxx Integration** - Direct API access for tags and posts
+2. **Dual-Model Nudity Detection** - Uses two NudeNet ONNX models (320n and 640m) running in parallel for better coverage
+3. **Direct ONNX Inference** - No OpenCV dependency (Railway doesn't have X11 libraries). Uses only `onnxruntime`, `numpy`, and `Pillow`
+4. **Black Box Censoring** - Detected NSFW regions get black rectangles drawn over them
+5. **Video/GIF Processing** - FFmpeg-based frame extraction, per-frame censoring, and reassembly
 
 ### Key Technical Decisions
 - **No OpenCV**: Direct ONNX inference with manual preprocessing (NCHW format, normalization) and postprocessing (YOLO output parsing, NMS)
 - **Dual label support**: vladmandic model uses different class names than official NudeNet - code detects model type by file size
+- **Rule34 over RedGifs**: Better tag search support, image-focused, working API
+
+### Rule34 API Endpoints Used
+- **Tags**: `https://api.rule34.xxx/index.php?page=dapi&s=tag&q=index&json=1`
+  - `orderby=updated` for trending, `orderby=count` for popular
+- **Posts**: `https://api.rule34.xxx/index.php?page=dapi&s=post&q=index&json=1&tags={tag}`
+  - Add `sort:score` to tags for highest rated
+- **Autocomplete**: `https://autocomplete.rule34.xxx/autocomplete.php?q={query}`
 
 ### Database Schema (SQLite)
-- `gif_cache` - Main GIF metadata storage
-- `gif_tags` - Many-to-many relationship between GIFs and tags
-- `tag_index` - Tag names with counts for quick lookup
-- `processed_media` - Paths to censored images + detection results
-- `captions` - Stored captions for GIFs
-
-### Bot Commands
-- `browse` / `trending` - Fetch trending from RedGifs, cache it
-- `browse <tag>` / `<tag>` - Filter cached content by tag
-- `tags` - List available cached tags with counts
-- `item <gif_id>` - Get specific GIF details
-- `help` - Show help
+- `post_cache` - Rule34 post metadata (id, tags, file_url, sample_url, width, height, file_type, score)
+- `processed_media` - Paths to censored images/videos + detection results
+- `captions` - Stored captions for posts
 
 ### REST Endpoints
-- `GET /` - Health check with cache stats
-- `GET /media/{gif_id}` - Serve censored image (processes on first request)
-- `GET /media/{gif_id}/detections` - Get detection results
-- `GET /tags` - List cached tags with counts
-- `GET /browse/tag/{tag}` - Get cached GIFs by tag
+- `GET /health` - Health check
+- `GET /tags/popular` - Get trending/popular tags (cached for 5 min)
+  - `?limit=50` - Number of tags
+  - `?order_by=updated|count` - Sort order
+- `GET /tags/autocomplete` - Tag autocomplete
+  - `?q=search_term` - Search query
+- `GET /posts` - Get posts for tag(s)
+  - `?tags=tag1 tag2` - Space-separated tags
+  - `?limit=50` - Number of posts
+  - `?page=0` - Pagination
+  - `?sort=score|id` - Sort by rating or recency
+- `GET /posts/{post_id}` - Get single post
+- `GET /media/{post_id}` - Serve censored media (processes on first request)
+- `GET /media/{post_id}/status` - Check if media is already processed
 
-### Current State
-The backend (`main.py`) is fully implemented with:
-- Trending-only content fetching
-- Local tag caching and filtering
-- Dual-model nudity detection and censoring
-- All REST endpoints
+### Poe Bot Commands
+- `/tags` - View trending tags
+- `/search <tag>` - Search posts by tag
 
 ### Files
 - `main.py` - The complete FastAPI server with Poe bot
-- `requirements.txt` - Dependencies (no OpenCV!)
+- `requirements.txt` - Dependencies (no OpenCV, no RedGifs!)
+- `railway.toml` - Railway deployment config
+- `Procfile` - Process file for deployment
 
 ### Dependencies (requirements.txt)
 ```
 fastapi-poe==0.0.48
 fastapi==0.109.2
 uvicorn[standard]==0.27.1
-redgifs>=2.3.0
 Pillow>=10.4.0
 httpx>=0.26.0
 aiosqlite>=0.19.0
@@ -69,16 +72,31 @@ numpy>=1.24.0
 ### Environment Variables
 - `DATABASE_PATH` - SQLite database path (default: `cache.db`)
 - `MEDIA_CACHE_DIR` - Where to store processed images (default: `media_cache`)
+- `VIDEO_CACHE_DIR` - Where to store processed videos (default: `video_cache`)
 - `MODEL_CACHE_DIR` - Where to store ONNX models (default: `models`)
 - `POE_ACCESS_KEY` - Poe API access key
 - `BOT_NAME` - Bot name (default: `SuperBrowser`)
 - `SERVER_URL` - Public URL of the server (for generating media URLs)
 - `CENSOR_THRESHOLD` - Detection confidence threshold (default: `0.4`)
+- `RULE34_TAG_CACHE_TTL` - How long to cache tag results in seconds (default: `300` = 5 min)
+
+### Video Processing Settings
+- `VIDEO_MAX_DURATION` - Max video length in seconds (default: `60`)
+- `VIDEO_TARGET_FPS` - Target FPS for processing (default: `15`)
+- `VIDEO_BATCH_SIZE` - Frames to process in parallel (default: `20`)
+- `VIDEO_USE_DUAL_MODELS` - Use both models for video (default: `false`)
+- `VIDEO_PRIMARY_MODEL` - Which model to use: `320n` or `640m` (default: `320n`)
 
 ---
+
+### Canvas App User Experience (Planned)
+1. **Main Page**: User sees list of trending tags from Rule34
+2. **Tag Selection**: User picks a tag (from list or via autocomplete search)
+3. **Browse View**: Grid of uncensored thumbnails (sample_url from Rule34)
+4. **Detail View**: Click thumbnail to see full censored image/video with caption
 
 ### Instructions for Future Instance
 1. **When outputting modified files**: Use the `mcp__attachments__output` tool and specify just the filename (e.g., `["main.py"]`), not the full path with `mnt/`
 2. The backend code is in `mnt/main.py` on the working directory
 3. The Canvas App frontend (`index.html`) has not been created yet
-4. If the user reports errors, check the RedGifs API calls first - the library's API changes between versions
+4. Thumbnails load directly from Rule34 CDN (uncensored) - only full images go through our censoring pipeline

@@ -1,6 +1,6 @@
 """
 Super Browser - Poe Server Bot
-A Poe-protocol-compatible server for browsing and processing RedGifs content.
+A Poe-protocol-compatible server for browsing and processing Rule34.xxx content.
 Features automated nudity detection and censoring using direct ONNX inference.
 """
 
@@ -12,9 +12,11 @@ import asyncio
 import tempfile
 import subprocess
 import shutil
+import time
 from pathlib import Path
 from typing import AsyncIterable
 from contextlib import asynccontextmanager
+from urllib.parse import quote, urlencode
 
 import httpx
 import aiosqlite
@@ -24,11 +26,9 @@ from PIL import Image, ImageDraw
 from dotenv import load_dotenv
 
 import fastapi_poe as fp
-from fastapi import FastAPI, Request, Response
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Request, Response, Query
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
-
-import redgifs
 
 load_dotenv()
 
@@ -43,10 +43,12 @@ POE_ACCESS_KEY = os.getenv("POE_ACCESS_KEY", "")
 BOT_NAME = os.getenv("BOT_NAME", "SuperBrowser")
 SERVER_URL = os.getenv("SERVER_URL", "")
 
+# Rule34 API configuration
+RULE34_API_BASE = "https://api.rule34.xxx/index.php"
+RULE34_AUTOCOMPLETE_BASE = "https://autocomplete.rule34.xxx/autocomplete.php"
+RULE34_TAG_CACHE_TTL = int(os.getenv("RULE34_TAG_CACHE_TTL", "300"))  # 5 minutes default
+
 # NudeNet model URLs - using dual models for better coverage
-# 320n: Fast, lightweight model (~6MB)
-# 640m: Larger, more accurate model (~25MB)
-# Using Hugging Face mirrors for reliable downloads
 NUDENET_320N_URLS = [
     "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/320n.onnx",
     "https://huggingface.co/vladmandic/nudenet/resolve/main/nudenet.onnx",
@@ -57,84 +59,36 @@ NUDENET_640M_URLS = [
 
 NUDENET_320N_PATH = MODEL_CACHE_DIR / "320n.onnx"
 NUDENET_640M_PATH = MODEL_CACHE_DIR / "640m.onnx"
-NUDENET_MODEL_MIN_SIZE_320 = 5 * 1024 * 1024   # Expect at least 5MB for 320n
-NUDENET_MODEL_MIN_SIZE_640 = 20 * 1024 * 1024  # Expect at least 20MB for 640m
+NUDENET_MODEL_MIN_SIZE_320 = 5 * 1024 * 1024
+NUDENET_MODEL_MIN_SIZE_640 = 20 * 1024 * 1024
 
 # Nudity censoring configuration
 CENSOR_THRESHOLD = float(os.getenv("CENSOR_THRESHOLD", "0.4"))
 
-# NudeNet class labels - supports both vladmandic and official 320n models
-# The vladmandic model uses slightly different naming
+# NudeNet class labels
 NUDENET_LABELS_VLADMANDIC = [
-    "female-private-area",   # 0 - covered
-    "female-face",           # 1
-    "buttocks-bare",         # 2 - NSFW
-    "female-breast-bare",    # 3 - NSFW
-    "female-vagina",         # 4 - NSFW
-    "male-breast-bare",      # 5
-    "anus-bare",             # 6 - NSFW
-    "feet-bare",             # 7
-    "belly",                 # 8 - covered
-    "feet",                  # 9 - covered
-    "armpits",               # 10 - covered
-    "armpits-bare",          # 11
-    "male-face",             # 12
-    "belly-bare",            # 13
-    "male-penis",            # 14 - NSFW
-    "anus-area",             # 15 - covered
-    "female-breast",         # 16 - covered
-    "buttocks",              # 17 - covered
+    "female-private-area", "female-face", "buttocks-bare", "female-breast-bare",
+    "female-vagina", "male-breast-bare", "anus-bare", "feet-bare", "belly",
+    "feet", "armpits", "armpits-bare", "male-face", "belly-bare", "male-penis",
+    "anus-area", "female-breast", "buttocks",
 ]
 
-# Official NudeNet 320n model labels
 NUDENET_LABELS_320N = [
-    "FEMALE_GENITALIA_COVERED",
-    "FACE_FEMALE",
-    "BUTTOCKS_EXPOSED",
-    "FEMALE_BREAST_EXPOSED",
-    "FEMALE_GENITALIA_EXPOSED",
-    "MALE_BREAST_EXPOSED",
-    "ANUS_EXPOSED",
-    "FEET_EXPOSED",
-    "BELLY_COVERED",
-    "FEET_COVERED",
-    "ARMPITS_COVERED",
-    "ARMPITS_EXPOSED",
-    "FACE_MALE",
-    "BELLY_EXPOSED",
-    "MALE_GENITALIA_EXPOSED",
-    "ANUS_COVERED",
-    "FEMALE_BREAST_COVERED",
+    "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
+    "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "MALE_BREAST_EXPOSED",
+    "ANUS_EXPOSED", "FEET_EXPOSED", "BELLY_COVERED", "FEET_COVERED",
+    "ARMPITS_COVERED", "ARMPITS_EXPOSED", "FACE_MALE", "BELLY_EXPOSED",
+    "MALE_GENITALIA_EXPOSED", "ANUS_COVERED", "FEMALE_BREAST_COVERED",
     "BUTTOCKS_COVERED",
 ]
 
-# Unified set of NSFW classes to censor (covers both naming conventions)
-# Includes both exposed AND covered versions of sensitive areas
 DEFAULT_CENSOR_CLASSES = [
-    # vladmandic naming - exposed
-    "buttocks-bare",
-    "female-breast-bare",
-    "female-vagina",
-    "anus-bare",
-    "male-penis",
-    "male-breast-bare",
-    # vladmandic naming - covered
-    "female-private-area",
-    "female-breast",
-    "buttocks",
-    "anus-area",
-    # Official 320n naming - exposed
-    "BUTTOCKS_EXPOSED",
-    "FEMALE_BREAST_EXPOSED",
-    "FEMALE_GENITALIA_EXPOSED",
-    "ANUS_EXPOSED",
-    "MALE_GENITALIA_EXPOSED",
-    "MALE_BREAST_EXPOSED",
-    # Official 320n naming - covered
-    "BUTTOCKS_COVERED",
-    "FEMALE_BREAST_COVERED",
-    "FEMALE_GENITALIA_COVERED",
-    "ANUS_COVERED",
+    "buttocks-bare", "female-breast-bare", "female-vagina", "anus-bare",
+    "male-penis", "male-breast-bare", "female-private-area", "female-breast",
+    "buttocks", "anus-area", "BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED",
+    "FEMALE_GENITALIA_EXPOSED", "ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED",
+    "MALE_BREAST_EXPOSED", "BUTTOCKS_COVERED", "FEMALE_BREAST_COVERED",
+    "FEMALE_GENITALIA_COVERED", "ANUS_COVERED",
 ]
 
 CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
@@ -142,14 +96,14 @@ CENSOR_CLASSES = [c.strip() for c in CENSOR_CLASSES if c.strip()]
 
 # Video processing configuration
 VIDEO_CACHE_DIR = Path(os.getenv("VIDEO_CACHE_DIR", "video_cache"))
-VIDEO_KEYFRAME_INTERVAL_SECONDS = float(os.getenv("VIDEO_KEYFRAME_INTERVAL_SECONDS", "1.0"))  # seconds between forced keyframes
-VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.15"))  # 15% pixel diff
-VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "60"))  # Max video duration in seconds
-VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "15"))  # Target FPS for processing (lower = faster)
-VIDEO_USE_DUAL_MODELS = os.getenv("VIDEO_USE_DUAL_MODELS", "false").lower() == "true"  # Use both 320n and 640m
-VIDEO_PRIMARY_MODEL = os.getenv("VIDEO_PRIMARY_MODEL", "320n")  # Which model to use if not dual: "320n" or "640m"
-VIDEO_BATCH_SIZE = int(os.getenv("VIDEO_BATCH_SIZE", "20"))  # Frames to process in parallel batches
-VIDEO_VERBOSE_LOGGING = os.getenv("VIDEO_VERBOSE_LOGGING", "true").lower() == "true"  # Detailed logging
+VIDEO_KEYFRAME_INTERVAL_SECONDS = float(os.getenv("VIDEO_KEYFRAME_INTERVAL_SECONDS", "1.0"))
+VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.15"))
+VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "60"))
+VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "15"))
+VIDEO_USE_DUAL_MODELS = os.getenv("VIDEO_USE_DUAL_MODELS", "false").lower() == "true"
+VIDEO_PRIMARY_MODEL = os.getenv("VIDEO_PRIMARY_MODEL", "320n")
+VIDEO_BATCH_SIZE = int(os.getenv("VIDEO_BATCH_SIZE", "20"))
+VIDEO_VERBOSE_LOGGING = os.getenv("VIDEO_VERBOSE_LOGGING", "true").lower() == "true"
 
 # Ensure directories exist
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -158,14 +112,293 @@ VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
+# Rule34 API Client
+# =============================================================================
+
+class Rule34Client:
+    """Client for interacting with Rule34.xxx API."""
+
+    def __init__(self):
+        self._http_client: httpx.AsyncClient | None = None
+        # In-memory cache for tags with TTL
+        self._tag_cache: dict[str, tuple[float, list]] = {}
+        self._tag_cache_lock = asyncio.Lock()
+
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=30.0,
+                follow_redirects=True,
+                headers={
+                    "User-Agent": "SuperBrowser/1.0 (Poe Bot)"
+                }
+            )
+        return self._http_client
+
+    async def close(self):
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    async def get_popular_tags(self, limit: int = 50, order_by: str = "updated") -> list[dict]:
+        """
+        Get popular/trending tags from Rule34.
+
+        Args:
+            limit: Number of tags to return (max 100)
+            order_by: "count" for most popular, "updated" for recently active
+
+        Returns:
+            List of tag dicts with 'name', 'count', 'type' fields
+        """
+        cache_key = f"popular_tags:{limit}:{order_by}"
+
+        async with self._tag_cache_lock:
+            if cache_key in self._tag_cache:
+                cached_time, cached_data = self._tag_cache[cache_key]
+                if time.time() - cached_time < RULE34_TAG_CACHE_TTL:
+                    print(f"[Rule34] Returning cached tags for {cache_key}")
+                    return cached_data
+
+        params = {
+            "page": "dapi",
+            "s": "tag",
+            "q": "index",
+            "json": "1",
+            "limit": min(limit, 100),
+            "orderby": order_by,
+        }
+
+        try:
+            response = await self.http_client.get(RULE34_API_BASE, params=params)
+            response.raise_for_status()
+
+            # Rule34 API returns JSON array directly
+            tags = response.json()
+
+            if not isinstance(tags, list):
+                print(f"[Rule34] Unexpected response format: {type(tags)}")
+                return []
+
+            # Normalize tag data
+            result = []
+            for tag in tags:
+                result.append({
+                    "name": tag.get("name", ""),
+                    "count": int(tag.get("count", 0)),
+                    "type": self._tag_type_name(tag.get("type", 0)),
+                })
+
+            # Cache the result
+            async with self._tag_cache_lock:
+                self._tag_cache[cache_key] = (time.time(), result)
+
+            print(f"[Rule34] Fetched {len(result)} tags")
+            return result
+
+        except Exception as e:
+            print(f"[Rule34] Error fetching tags: {e}")
+            return []
+
+    def _tag_type_name(self, type_id: int) -> str:
+        """Convert Rule34 tag type ID to name."""
+        types = {
+            0: "general",
+            1: "artist",
+            3: "copyright",
+            4: "character",
+            5: "metadata",
+        }
+        return types.get(type_id, "general")
+
+    async def autocomplete_tags(self, query: str, limit: int = 20) -> list[dict]:
+        """
+        Get tag autocomplete suggestions.
+
+        Args:
+            query: Partial tag name
+            limit: Max results to return
+
+        Returns:
+            List of tag suggestions with 'label' and 'value' fields
+        """
+        if not query or len(query) < 2:
+            return []
+
+        cache_key = f"autocomplete:{query.lower()}"
+
+        async with self._tag_cache_lock:
+            if cache_key in self._tag_cache:
+                cached_time, cached_data = self._tag_cache[cache_key]
+                if time.time() - cached_time < RULE34_TAG_CACHE_TTL:
+                    return cached_data[:limit]
+
+        try:
+            response = await self.http_client.get(
+                RULE34_AUTOCOMPLETE_BASE,
+                params={"q": query}
+            )
+            response.raise_for_status()
+
+            suggestions = response.json()
+
+            if not isinstance(suggestions, list):
+                return []
+
+            # Normalize format
+            result = []
+            for s in suggestions[:limit]:
+                if isinstance(s, dict):
+                    result.append({
+                        "label": s.get("label", s.get("value", "")),
+                        "value": s.get("value", s.get("label", "")),
+                    })
+                elif isinstance(s, str):
+                    result.append({"label": s, "value": s})
+
+            # Cache results
+            async with self._tag_cache_lock:
+                self._tag_cache[cache_key] = (time.time(), result)
+
+            return result
+
+        except Exception as e:
+            print(f"[Rule34] Autocomplete error: {e}")
+            return []
+
+    async def get_posts(
+        self,
+        tags: str,
+        limit: int = 50,
+        page: int = 0,
+        sort: str = "score"
+    ) -> list[dict]:
+        """
+        Get posts matching given tags.
+
+        Args:
+            tags: Space-separated tags (use sort:score for highest rated)
+            limit: Number of posts (max 1000)
+            page: Page number (0-indexed)
+            sort: "score" for highest rated, "id" for newest
+
+        Returns:
+            List of post dicts with id, file_url, sample_url, tags, etc.
+        """
+        # Add sort tag if specified
+        search_tags = tags
+        if sort == "score":
+            search_tags = f"sort:score {tags}"
+        elif sort == "id":
+            search_tags = f"sort:id:desc {tags}"
+
+        params = {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": "1",
+            "limit": min(limit, 1000),
+            "pid": page,
+            "tags": search_tags,
+        }
+
+        try:
+            response = await self.http_client.get(RULE34_API_BASE, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+
+            # API returns list of posts directly
+            if not isinstance(data, list):
+                print(f"[Rule34] Unexpected posts response: {type(data)}")
+                return []
+
+            # Normalize post data
+            posts = []
+            for post in data:
+                file_url = post.get("file_url", "")
+                sample_url = post.get("sample_url", "") or post.get("preview_url", "")
+                preview_url = post.get("preview_url", "")
+
+                # Determine file type from URL
+                file_type = self._determine_file_type(file_url)
+
+                posts.append({
+                    "id": int(post.get("id", 0)),
+                    "tags": post.get("tags", ""),
+                    "file_url": file_url,
+                    "sample_url": sample_url,
+                    "preview_url": preview_url,
+                    "width": int(post.get("width", 0)),
+                    "height": int(post.get("height", 0)),
+                    "score": int(post.get("score", 0)),
+                    "file_type": file_type,
+                    "source": post.get("source", ""),
+                })
+
+            print(f"[Rule34] Fetched {len(posts)} posts for tags: {tags}")
+            return posts
+
+        except Exception as e:
+            print(f"[Rule34] Error fetching posts: {e}")
+            return []
+
+    def _determine_file_type(self, url: str) -> str:
+        """Determine file type from URL."""
+        url_lower = url.lower()
+        if url_lower.endswith(('.mp4', '.webm')):
+            return "video"
+        elif url_lower.endswith('.gif'):
+            return "gif"
+        else:
+            return "image"
+
+    async def get_post_by_id(self, post_id: int) -> dict | None:
+        """Get a single post by ID."""
+        params = {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": "1",
+            "id": post_id,
+        }
+
+        try:
+            response = await self.http_client.get(RULE34_API_BASE, params=params)
+            response.raise_for_status()
+
+            data = response.json()
+
+            if isinstance(data, list) and len(data) > 0:
+                post = data[0]
+                file_url = post.get("file_url", "")
+                return {
+                    "id": int(post.get("id", 0)),
+                    "tags": post.get("tags", ""),
+                    "file_url": file_url,
+                    "sample_url": post.get("sample_url", "") or post.get("preview_url", ""),
+                    "preview_url": post.get("preview_url", ""),
+                    "width": int(post.get("width", 0)),
+                    "height": int(post.get("height", 0)),
+                    "score": int(post.get("score", 0)),
+                    "file_type": self._determine_file_type(file_url),
+                    "source": post.get("source", ""),
+                }
+
+            return None
+
+        except Exception as e:
+            print(f"[Rule34] Error fetching post {post_id}: {e}")
+            return None
+
+
+# =============================================================================
 # Direct ONNX NudeNet Detector (No OpenCV!)
 # =============================================================================
 
 class NudeDetectorONNX:
-    """
-    NudeNet detector using direct ONNX inference.
-    No OpenCV dependency - uses only Pillow and numpy.
-    """
+    """NudeNet detector using direct ONNX inference."""
 
     def __init__(
         self,
@@ -181,12 +414,11 @@ class NudeDetectorONNX:
         self.input_size = input_size
         self.name = name
         self.session: ort.InferenceSession | None = None
-        self.labels: list[str] = NUDENET_LABELS_VLADMANDIC  # Default, updated on load
+        self.labels: list[str] = NUDENET_LABELS_VLADMANDIC
         self._lock = asyncio.Lock()
 
     async def ensure_model_downloaded(self):
         """Download the ONNX model if not present or corrupted."""
-        # Check if model exists and is valid size
         if self.model_path.exists():
             file_size = self.model_path.stat().st_size
             if file_size >= self.min_size:
@@ -196,7 +428,6 @@ class NudeDetectorONNX:
                 print(f"[{self.name}] Model file too small ({file_size} bytes), re-downloading...")
                 self.model_path.unlink()
 
-        # Try each URL until one works
         last_error = None
         for url in self.model_urls:
             try:
@@ -207,7 +438,6 @@ class NudeDetectorONNX:
             except Exception as e:
                 print(f"[{self.name}] Failed to download from {url}: {e}")
                 last_error = e
-                # Clean up partial download
                 if self.model_path.exists():
                     self.model_path.unlink()
 
@@ -222,14 +452,9 @@ class NudeDetectorONNX:
             content = response.content
             content_size = len(content)
 
-            # Verify we got actual model data, not an HTML error page
             if content_size < self.min_size:
-                raise RuntimeError(
-                    f"Downloaded file too small ({content_size} bytes). "
-                    f"Expected at least {self.min_size} bytes."
-                )
+                raise RuntimeError(f"Downloaded file too small ({content_size} bytes).")
 
-            # Check it's not HTML
             if content[:100].lower().find(b'<!doctype') >= 0 or content[:100].lower().find(b'<html') >= 0:
                 raise RuntimeError("Downloaded HTML instead of ONNX model file")
 
@@ -244,69 +469,44 @@ class NudeDetectorONNX:
             await self.ensure_model_downloaded()
 
             print(f"[{self.name}] Loading ONNX model...")
-            # Run in thread to avoid blocking
             self.session = await asyncio.to_thread(
                 ort.InferenceSession,
                 str(self.model_path),
                 providers=["CPUExecutionProvider"]
             )
 
-            # Detect model type based on output shape
             output_shape = self.session.get_outputs()[0].shape
             print(f"[{self.name}] Model output shape: {output_shape}")
 
-            # Determine input size from model
             input_shape = self.session.get_inputs()[0].shape
             print(f"[{self.name}] Model input shape: {input_shape}")
 
-            # Update input_size based on model (if detectable from shape)
-            # Shape is typically [batch, channels, height, width] = [1, 3, 320, 320] or [1, 3, 640, 640]
             if input_shape and len(input_shape) >= 4 and isinstance(input_shape[2], int):
                 self.input_size = input_shape[2]
                 print(f"[{self.name}] Using input size: {self.input_size}")
 
-            # Both models should have 18 classes, but file size differs
-            # vladmandic is ~12MB, 320n/640m are from official repo
             file_size = self.model_path.stat().st_size
             if file_size > 10 * 1024 * 1024 and file_size < 20 * 1024 * 1024:
-                # 10-20MB = vladmandic model
                 self.labels = NUDENET_LABELS_VLADMANDIC
                 print(f"[{self.name}] Detected vladmandic/nudenet model")
             else:
-                # Official models (320n ~6MB, 640m ~25MB)
                 self.labels = NUDENET_LABELS_320N
                 print(f"[{self.name}] Detected official NudeNet model")
 
             print(f"[{self.name}] Model loaded successfully with {len(self.labels)} classes")
 
     def _preprocess(self, image: Image.Image) -> tuple[np.ndarray, tuple[int, int], tuple[float, float]]:
-        """
-        Preprocess image for NudeNet model.
+        """Preprocess image for NudeNet model."""
+        original_size = image.size
 
-        Returns:
-            - input_tensor: Preprocessed image tensor
-            - original_size: (width, height) of original image
-            - scale: (scale_x, scale_y) to map boxes back to original size
-        """
-        original_size = image.size  # (width, height)
-
-        # Convert to RGB if necessary
         if image.mode != "RGB":
             image = image.convert("RGB")
 
-        # Resize to model input size (320x320)
         resized = image.resize((self.input_size, self.input_size), Image.Resampling.BILINEAR)
-
-        # Convert to numpy array and normalize to 0-1
         img_array = np.array(resized, dtype=np.float32) / 255.0
-
-        # Transpose from HWC to CHW format (height, width, channels -> channels, height, width)
         img_array = np.transpose(img_array, (2, 0, 1))
-
-        # Add batch dimension: (1, 3, 320, 320) - NCHW format
         input_tensor = np.expand_dims(img_array, axis=0)
 
-        # Calculate scale factors to map detections back to original size
         scale_x = original_size[0] / self.input_size
         scale_y = original_size[1] / self.input_size
 
@@ -318,50 +518,27 @@ class NudeDetectorONNX:
         scale: tuple[float, float],
         threshold: float = 0.25
     ) -> list[dict]:
-        """
-        Postprocess model outputs to get detections.
-
-        NudeNet 320n output format:
-        - outputs[0]: shape (1, 18, 2100) - predictions
-          - 18 = number of classes
-          - 2100 = number of anchor boxes
-          - Each column: [x_center, y_center, width, height, class_scores...]
-
-        Returns list of detections with class, score, and box.
-        """
-        predictions = outputs[0]  # Shape: (1, num_features, num_boxes)
-
-        # Squeeze batch dimension and transpose to (num_boxes, num_features)
-        predictions = predictions[0].T  # Shape: (2100, 18+4) or similar
-
-        # The model outputs: first 4 values are box coords, rest are class scores
-        # Actually for YOLOv8 format: (batch, 4+num_classes, num_boxes)
-        # After transpose: (num_boxes, 4+num_classes)
+        """Postprocess model outputs to get detections."""
+        predictions = outputs[0]
+        predictions = predictions[0].T
 
         scale_x, scale_y = scale
         detections = []
 
         for pred in predictions:
-            # First 4 values: x_center, y_center, width, height (in input scale 0-320)
             x_center, y_center, w, h = pred[:4]
-
-            # Remaining values are class scores
             class_scores = pred[4:]
-
-            # Get best class
             class_id = int(np.argmax(class_scores))
             score = float(class_scores[class_id])
 
             if score < threshold:
                 continue
 
-            # Convert from center format to corner format and scale to original size
             x1 = (x_center - w / 2) * scale_x
             y1 = (y_center - h / 2) * scale_y
             box_w = w * scale_x
             box_h = h * scale_y
 
-            # Clamp to positive values
             x1 = max(0, x1)
             y1 = max(0, y1)
 
@@ -371,41 +548,32 @@ class NudeDetectorONNX:
                 "box": [int(x1), int(y1), int(box_w), int(box_h)]
             })
 
-        # Apply Non-Maximum Suppression
         detections = self._nms(detections, iou_threshold=0.45)
-
         return detections
 
     def _nms(self, detections: list[dict], iou_threshold: float = 0.45) -> list[dict]:
-        """Apply Non-Maximum Suppression to remove overlapping boxes."""
+        """Apply Non-Maximum Suppression."""
         if not detections:
             return []
 
-        # Sort by score descending
         detections = sorted(detections, key=lambda x: x["score"], reverse=True)
-
         keep = []
+
         while detections:
             best = detections.pop(0)
             keep.append(best)
-
-            detections = [
-                d for d in detections
-                if self._iou(best["box"], d["box"]) < iou_threshold
-            ]
+            detections = [d for d in detections if self._iou(best["box"], d["box"]) < iou_threshold]
 
         return keep
 
     def _iou(self, box1: list[int], box2: list[int]) -> float:
-        """Calculate Intersection over Union between two boxes."""
+        """Calculate Intersection over Union."""
         x1, y1, w1, h1 = box1
         x2, y2, w2, h2 = box2
 
-        # Convert to corner format
         box1_x2, box1_y2 = x1 + w1, y1 + h1
         box2_x2, box2_y2 = x2 + w2, y2 + h2
 
-        # Calculate intersection
         inter_x1 = max(x1, x2)
         inter_y1 = max(y1, y2)
         inter_x2 = min(box1_x2, box2_x2)
@@ -413,7 +581,6 @@ class NudeDetectorONNX:
 
         inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
 
-        # Calculate union
         box1_area = w1 * h1
         box2_area = w2 * h2
         union_area = box1_area + box2_area - inter_area
@@ -424,53 +591,32 @@ class NudeDetectorONNX:
         return inter_area / union_area
 
     async def detect(self, image_bytes: bytes, threshold: float = 0.25) -> list[dict]:
-        """
-        Detect nudity in an image.
-
-        Args:
-            image_bytes: Raw image bytes
-            threshold: Minimum confidence score
-
-        Returns:
-            List of detections with class, score, and box
-        """
+        """Detect nudity in an image."""
         if self.session is None:
             await self.load()
 
-        # Load image
         image = Image.open(io.BytesIO(image_bytes))
-
-        # Preprocess
         input_tensor, original_size, scale = self._preprocess(image)
-
-        # Get input name from model
         input_name = self.session.get_inputs()[0].name
 
-        # Run inference
         outputs = await asyncio.to_thread(
             self.session.run,
             None,
             {input_name: input_tensor}
         )
 
-        # Postprocess
         detections = self._postprocess(outputs, scale, threshold)
-
         return detections
 
 
 # =============================================================================
-# NudeNet Censor (using our ONNX detector)
+# NudeNet Censor
 # =============================================================================
 
 class NudeNetCensor:
-    """
-    Wrapper that combines detection and censoring.
-    Uses dual models (320n and 640m) for better coverage.
-    """
+    """Wrapper that combines detection and censoring."""
 
     def __init__(self):
-        # Initialize both detectors
         self.detector_320n = NudeDetectorONNX(
             model_path=NUDENET_320N_PATH,
             model_urls=NUDENET_320N_URLS,
@@ -498,1542 +644,518 @@ class NudeNetCensor:
     async def censor_image(
         self,
         image_bytes: bytes,
-        classes: list[str] | None = None,
-        threshold: float = CENSOR_THRESHOLD,
+        censor_classes: list[str] | None = None,
+        threshold: float = 0.25,
+        use_dual_models: bool = True,
+        primary_model: str = "320n"
     ) -> tuple[bytes, list[dict]]:
         """
-        Detect and censor nudity in an image using dual models.
-        Merges results from both 320n and 640m models for maximum coverage.
-
-        Args:
-            image_bytes: Raw image bytes
-            classes: List of body part classes to censor
-            threshold: Minimum confidence score for detection
+        Detect and censor NSFW content in an image.
 
         Returns:
-            Tuple of (censored_image_bytes, all_detections)
+            Tuple of (censored_image_bytes, list_of_detections)
         """
-        classes_to_censor = classes or CENSOR_CLASSES
+        if censor_classes is None:
+            censor_classes = CENSOR_CLASSES
 
-        # Run both detectors in parallel
-        detections_320n, detections_640m = await asyncio.gather(
-            self.detector_320n.detect(image_bytes, threshold=threshold),
-            self.detector_640m.detect(image_bytes, threshold=threshold)
-        )
+        # Run detection with selected model(s)
+        if use_dual_models:
+            results_320n, results_640m = await asyncio.gather(
+                self.detector_320n.detect(image_bytes, threshold),
+                self.detector_640m.detect(image_bytes, threshold)
+            )
+            all_detections = results_320n + results_640m
+        else:
+            if primary_model == "640m":
+                all_detections = await self.detector_640m.detect(image_bytes, threshold)
+            else:
+                all_detections = await self.detector_320n.detect(image_bytes, threshold)
 
-        # Tag detections with source model for debugging
-        for d in detections_320n:
-            d["model"] = "320n"
-        for d in detections_640m:
-            d["model"] = "640m"
+        # Filter to censor classes
+        to_censor = [d for d in all_detections if d["class"] in censor_classes]
 
-        # Merge all detections
-        all_detections = detections_320n + detections_640m
+        if not to_censor:
+            return image_bytes, all_detections
 
-        # Apply NMS across merged detections to remove duplicates
-        merged_detections = self._merge_detections(all_detections)
+        # Apply censoring
+        image = Image.open(io.BytesIO(image_bytes))
+        if image.mode != "RGB":
+            image = image.convert("RGB")
 
-        # Filter detections to censor
-        filtered_detections = [
-            d for d in merged_detections
-            if d["class"] in classes_to_censor
-        ]
+        draw = ImageDraw.Draw(image)
 
-        if not filtered_detections:
-            # No nudity detected that needs censoring
-            return image_bytes, merged_detections
-
-        # Apply black boxes
-        censored_bytes = await asyncio.to_thread(
-            self._apply_black_boxes,
-            image_bytes,
-            filtered_detections
-        )
-
-        return censored_bytes, merged_detections
-
-    def _merge_detections(self, detections: list[dict], iou_threshold: float = 0.5) -> list[dict]:
-        """
-        Merge detections from multiple models using NMS.
-        Keeps the detection with highest score when boxes overlap.
-        """
-        if not detections:
-            return []
-
-        # Sort by score descending
-        detections = sorted(detections, key=lambda x: x["score"], reverse=True)
-
-        keep = []
-        while detections:
-            best = detections.pop(0)
-            keep.append(best)
-
-            # Remove overlapping detections of the same class
-            detections = [
-                d for d in detections
-                if d["class"] != best["class"] or self._iou(best["box"], d["box"]) < iou_threshold
-            ]
-
-        return keep
-
-    def _iou(self, box1: list[int], box2: list[int]) -> float:
-        """Calculate Intersection over Union between two boxes."""
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-
-        box1_x2, box1_y2 = x1 + w1, y1 + h1
-        box2_x2, box2_y2 = x2 + w2, y2 + h2
-
-        inter_x1 = max(x1, x2)
-        inter_y1 = max(y1, y2)
-        inter_x2 = min(box1_x2, box2_x2)
-        inter_y2 = min(box1_y2, box2_y2)
-
-        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - inter_area
-
-        if union_area == 0:
-            return 0
-
-        return inter_area / union_area
-
-    def _apply_black_boxes(self, image_bytes: bytes, detections: list[dict]) -> bytes:
-        """Apply black boxes over detected regions."""
-        img = Image.open(io.BytesIO(image_bytes))
-
-        # Convert to RGB if necessary
-        if img.mode in ('RGBA', 'P'):
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-
-        draw = ImageDraw.Draw(img)
-
-        for detection in detections:
-            box = detection["box"]
-            x, y, w, h = box
-            # Draw black rectangle
-            draw.rectangle([x, y, x + w, y + h], fill=(0, 0, 0))
+        for detection in to_censor:
+            x, y, w, h = detection["box"]
+            # Apply expanded box with rounded corners effect via solid fill
+            padding = int(min(w, h) * 0.1)
+            x1 = max(0, x - padding)
+            y1 = max(0, y - padding)
+            x2 = min(image.width, x + w + padding)
+            y2 = min(image.height, y + h + padding)
+            draw.rectangle([x1, y1, x2, y2], fill=(0, 0, 0))
 
         # Save to bytes
         output = io.BytesIO()
-        img.save(output, format='JPEG', quality=85)
-        return output.getvalue()
-
-
-# Global NudeNet censor instance
-nudenet_censor = NudeNetCensor()
+        image.save(output, format="JPEG", quality=90)
+        return output.getvalue(), all_detections
 
 
 # =============================================================================
-# Video Processor - Frame-by-frame with Smart Keyframes & Interpolation
+# Video/GIF Processing
 # =============================================================================
 
-class VideoProcessor:
-    """
-    Processes videos by detecting nudity on keyframes and interpolating
-    censor boxes smoothly between them.
-
-    Features:
-    - Smart keyframe detection (scene changes)
-    - Time-distributed keyframes as fallback
-    - Smooth box interpolation between keyframes
-    - Configurable single or dual model detection
-    """
+class VideoCensorProcessor:
+    """Process and censor videos/GIFs using FFmpeg and NudeNet."""
 
     def __init__(self, censor: NudeNetCensor):
         self.censor = censor
-        self.keyframe_interval_seconds = VIDEO_KEYFRAME_INTERVAL_SECONDS
-        self.scene_change_threshold = VIDEO_SCENE_CHANGE_THRESHOLD
-        self.target_fps = VIDEO_TARGET_FPS
-        self.max_duration = VIDEO_MAX_DURATION
-        self.use_dual_models = VIDEO_USE_DUAL_MODELS
-        self.primary_model = VIDEO_PRIMARY_MODEL
-        self.batch_size = VIDEO_BATCH_SIZE
-        self.verbose = VIDEO_VERBOSE_LOGGING
+        self._http_client: httpx.AsyncClient | None = None
 
-    def _log(self, msg: str, force: bool = False):
-        """Log a message if verbose logging is enabled."""
-        if self.verbose or force:
-            print(f"[VideoProcessor] {msg}")
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
+        return self._http_client
 
-    async def process_video(self, video_bytes: bytes, quality: str = "sd") -> tuple[bytes, dict]:
+    async def close(self):
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+
+    async def download_video(self, url: str) -> bytes:
+        """Download video from URL."""
+        response = await self.http_client.get(url)
+        response.raise_for_status()
+        return response.content
+
+    async def process_video(
+        self,
+        video_bytes: bytes,
+        output_format: str = "mp4",
+        max_duration: int | None = None
+    ) -> tuple[bytes, dict]:
         """
-        Process a video with nudity censoring.
-
-        Args:
-            video_bytes: Raw video bytes
-            quality: Output quality ("sd" or "hd")
+        Process and censor a video.
 
         Returns:
-            Tuple of (processed_video_bytes, processing_stats)
+            Tuple of (censored_video_bytes, processing_stats)
         """
-        import time
+        max_duration = max_duration or VIDEO_MAX_DURATION
 
-        stats = {
-            "total_frames": 0,
-            "keyframes_detected": 0,
-            "scene_changes_detected": 0,
-            "time_based_keyframes": 0,
-            "detections_total": 0,
-            "processing_time_seconds": 0,
-            "timing_breakdown": {},
-            "config": {
-                "target_fps": self.target_fps,
-                "keyframe_interval_seconds": self.keyframe_interval_seconds,
-                "scene_change_threshold": self.scene_change_threshold,
-                "use_dual_models": self.use_dual_models,
-                "primary_model": self.primary_model if not self.use_dual_models else "both",
-                "batch_size": self.batch_size,
-            }
-        }
-
-        total_start = time.time()
-        self._log(f"=== Starting video processing ({len(video_bytes) / 1024 / 1024:.1f} MB) ===", force=True)
-        self._log(f"Config: fps={self.target_fps}, keyframe_interval={self.keyframe_interval_seconds}s, "
-                  f"scene_threshold={self.scene_change_threshold}, dual_models={self.use_dual_models}")
-
-        # Create temporary directory for frame processing
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
-            input_video = temp_path / "input.mp4"
-            output_video = temp_path / "output.mp4"
+            input_path = temp_path / "input.mp4"
             frames_dir = temp_path / "frames"
-            processed_dir = temp_path / "processed"
-            audio_file = temp_path / "audio.aac"
+            censored_dir = temp_path / "censored"
+            output_path = temp_path / f"output.{output_format}"
 
             frames_dir.mkdir()
-            processed_dir.mkdir()
+            censored_dir.mkdir()
 
             # Write input video
-            await asyncio.to_thread(input_video.write_bytes, video_bytes)
+            input_path.write_bytes(video_bytes)
 
             # Get video info
-            step_start = time.time()
-            video_info = await self._get_video_info(input_video)
-            original_fps = video_info.get("fps", 30)
-            fps = min(original_fps, self.target_fps)
-            duration = min(video_info.get("duration", 10), self.max_duration)
-            has_audio = video_info.get("has_audio", False)
-            stats["timing_breakdown"]["get_video_info"] = round(time.time() - step_start, 2)
-            self._log(f"Video info: {duration:.1f}s duration, {original_fps:.1f} original fps -> {fps} target fps, audio={has_audio}")
+            probe_cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,r_frame_rate,duration",
+                "-of", "json",
+                str(input_path)
+            ]
 
-            # Calculate keyframe interval in frames
-            keyframe_interval_frames = max(1, int(fps * self.keyframe_interval_seconds))
-            self._log(f"Keyframe interval: every {keyframe_interval_frames} frames ({self.keyframe_interval_seconds}s)")
+            probe_result = await asyncio.to_thread(
+                subprocess.run, probe_cmd, capture_output=True, text=True
+            )
+
+            video_info = {"width": 0, "height": 0, "fps": 30, "duration": 0}
+            try:
+                probe_data = json.loads(probe_result.stdout)
+                stream = probe_data.get("streams", [{}])[0]
+                video_info["width"] = int(stream.get("width", 0))
+                video_info["height"] = int(stream.get("height", 0))
+
+                fps_str = stream.get("r_frame_rate", "30/1")
+                if "/" in fps_str:
+                    num, den = map(int, fps_str.split("/"))
+                    video_info["fps"] = num / den if den else 30
+                else:
+                    video_info["fps"] = float(fps_str)
+
+                video_info["duration"] = float(stream.get("duration", 0))
+            except Exception as e:
+                print(f"[Video] Probe error: {e}")
+
+            # Limit duration
+            duration_limit = min(video_info["duration"], max_duration) if video_info["duration"] > 0 else max_duration
 
             # Extract frames
-            step_start = time.time()
-            await self._extract_frames(input_video, frames_dir, fps)
-            stats["timing_breakdown"]["extract_frames"] = round(time.time() - step_start, 2)
+            target_fps = min(VIDEO_TARGET_FPS, video_info["fps"])
+            extract_cmd = [
+                "ffmpeg", "-y",
+                "-i", str(input_path),
+                "-t", str(duration_limit),
+                "-vf", f"fps={target_fps}",
+                "-q:v", "2",
+                str(frames_dir / "frame_%05d.jpg")
+            ]
 
-            # Extract audio if present
-            if has_audio:
-                step_start = time.time()
-                await self._extract_audio(input_video, audio_file)
-                stats["timing_breakdown"]["extract_audio"] = round(time.time() - step_start, 2)
-
-            # Get list of frames
-            frame_files = sorted(frames_dir.glob("*.png"))
-            stats["total_frames"] = len(frame_files)
-            self._log(f"Extracted {len(frame_files)} frames in {stats['timing_breakdown']['extract_frames']:.1f}s")
-
-            if not frame_files:
-                raise ValueError("No frames extracted from video")
-
-            # Identify keyframes and run detection
-            step_start = time.time()
-            keyframe_data, keyframe_stats = await self._process_keyframes(frame_files, keyframe_interval_frames)
-            stats["timing_breakdown"]["process_keyframes"] = round(time.time() - step_start, 2)
-            stats["keyframes_detected"] = len(keyframe_data)
-            stats["scene_changes_detected"] = keyframe_stats.get("scene_changes", 0)
-            stats["time_based_keyframes"] = keyframe_stats.get("time_based", 0)
-            stats["detections_total"] = sum(len(kf["detections"]) for kf in keyframe_data.values())
-
-            self._log(f"Keyframes: {len(keyframe_data)} total ({stats['scene_changes_detected']} scene changes, "
-                      f"{stats['time_based_keyframes']} time-based) in {stats['timing_breakdown']['process_keyframes']:.1f}s", force=True)
-            self._log(f"Total detections across keyframes: {stats['detections_total']}")
-
-            # Process all frames with interpolation
-            step_start = time.time()
-            await self._apply_censorship_with_interpolation(
-                frame_files,
-                keyframe_data,
-                processed_dir
-            )
-            stats["timing_breakdown"]["apply_censorship"] = round(time.time() - step_start, 2)
-            self._log(f"Applied censorship to {len(frame_files)} frames in {stats['timing_breakdown']['apply_censorship']:.1f}s")
-
-            # Encode output video
-            step_start = time.time()
-            await self._encode_video(
-                processed_dir,
-                output_video,
-                fps,
-                audio_file if has_audio and audio_file.exists() else None
-            )
-            stats["timing_breakdown"]["encode_video"] = round(time.time() - step_start, 2)
-            self._log(f"Encoded video in {stats['timing_breakdown']['encode_video']:.1f}s")
-
-            # Read output
-            output_bytes = await asyncio.to_thread(output_video.read_bytes)
-
-            stats["processing_time_seconds"] = round(time.time() - total_start, 2)
-            stats["output_size_mb"] = round(len(output_bytes) / 1024 / 1024, 2)
-
-            self._log(f"=== Processing complete: {stats['processing_time_seconds']}s total, "
-                      f"{stats['output_size_mb']} MB output ===", force=True)
-            self._log(f"Timing breakdown: {stats['timing_breakdown']}", force=True)
-
-            return output_bytes, stats
-
-    async def _get_video_info(self, video_path: Path) -> dict:
-        """Get video metadata using ffprobe."""
-        cmd = [
-            "ffprobe",
-            "-v", "quiet",
-            "-print_format", "json",
-            "-show_format",
-            "-show_streams",
-            str(video_path)
-        ]
-
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True
-        )
-
-        if result.returncode != 0:
-            print(f"ffprobe error: {result.stderr}")
-            return {"fps": 30, "duration": 10, "has_audio": False}
-
-        try:
-            data = json.loads(result.stdout)
-
-            # Find video stream
-            fps = 30.0
-            has_audio = False
-
-            for stream in data.get("streams", []):
-                if stream.get("codec_type") == "video":
-                    # Parse frame rate (could be "30/1" or "29.97")
-                    fps_str = stream.get("r_frame_rate", "30/1")
-                    if "/" in fps_str:
-                        num, den = fps_str.split("/")
-                        fps = float(num) / float(den) if float(den) != 0 else 30
-                    else:
-                        fps = float(fps_str)
-                elif stream.get("codec_type") == "audio":
-                    has_audio = True
-
-            duration = float(data.get("format", {}).get("duration", 10))
-
-            return {"fps": fps, "duration": duration, "has_audio": has_audio}
-        except (json.JSONDecodeError, KeyError, ValueError) as e:
-            print(f"Error parsing video info: {e}")
-            return {"fps": 30, "duration": 10, "has_audio": False}
-
-    async def _extract_frames(self, video_path: Path, output_dir: Path, fps: float):
-        """Extract frames from video using ffmpeg."""
-        cmd = [
-            "ffmpeg",
-            "-i", str(video_path),
-            "-vf", f"fps={fps}",
-            "-q:v", "2",  # High quality PNG
-            str(output_dir / "frame_%06d.png"),
-            "-y",
-            "-loglevel", "error"
-        ]
-
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"Frame extraction failed: {result.stderr}")
-
-    async def _extract_audio(self, video_path: Path, audio_path: Path):
-        """Extract audio track from video."""
-        cmd = [
-            "ffmpeg",
-            "-i", str(video_path),
-            "-vn",  # No video
-            "-acodec", "aac",
-            "-b:a", "128k",
-            str(audio_path),
-            "-y",
-            "-loglevel", "error"
-        ]
-
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True
-        )
-
-        # Audio extraction can fail if no audio - that's OK
-        if result.returncode != 0:
-            print(f"Audio extraction skipped: {result.stderr}")
-
-    async def _process_keyframes(self, frame_files: list[Path], keyframe_interval: int) -> tuple[dict[int, dict], dict]:
-        """
-        Identify keyframes and run detection on them.
-
-        Returns:
-            - dict mapping frame index to detection data
-            - stats dict with keyframe breakdown
-        """
-        import time
-
-        keyframe_data = {}
-        keyframe_stats = {"scene_changes": 0, "time_based": 0, "first_frame": 0}
-        prev_frame_array = None
-        last_keyframe_idx = -keyframe_interval  # Force first frame to be keyframe
-
-        total_frames = len(frame_files)
-        detection_times = []
-
-        for idx, frame_path in enumerate(frame_files):
-            # Load frame for comparison
-            frame_bytes = await asyncio.to_thread(frame_path.read_bytes)
-            frame_img = Image.open(io.BytesIO(frame_bytes))
-            frame_array = self._get_comparison_array(frame_img)
-
-            # Determine if this is a keyframe
-            is_keyframe = False
-            keyframe_reason = None
-
-            # Always make first frame a keyframe
-            if idx == 0:
-                is_keyframe = True
-                keyframe_reason = "first_frame"
-            # Time-distributed keyframe (fallback interval)
-            elif idx - last_keyframe_idx >= keyframe_interval:
-                is_keyframe = True
-                keyframe_reason = "time_based"
-            # Scene change detection
-            elif prev_frame_array is not None:
-                diff = self._frame_difference(prev_frame_array, frame_array)
-                if diff > self.scene_change_threshold:
-                    is_keyframe = True
-                    keyframe_reason = "scene_change"
-                    self._log(f"Scene change at frame {idx}/{total_frames}, diff={diff:.3f}")
-
-            if is_keyframe:
-                # Run detection on this keyframe
-                detect_start = time.time()
-                detections = await self._detect_frame(frame_bytes)
-                detect_time = time.time() - detect_start
-                detection_times.append(detect_time)
-
-                censor_boxes = self._extract_censor_boxes(detections)
-                keyframe_data[idx] = {
-                    "detections": detections,
-                    "boxes": censor_boxes
-                }
-                last_keyframe_idx = idx
-                keyframe_stats[keyframe_reason] = keyframe_stats.get(keyframe_reason, 0) + 1
-
-                self._log(f"Keyframe {len(keyframe_data)}: frame {idx}/{total_frames} ({keyframe_reason}), "
-                          f"{len(detections)} detections, {len(censor_boxes)} to censor, {detect_time:.2f}s")
-
-            prev_frame_array = frame_array
-
-            # Progress logging every 25%
-            if idx > 0 and idx % max(1, total_frames // 4) == 0:
-                self._log(f"Keyframe scan progress: {idx}/{total_frames} frames ({100*idx//total_frames}%)")
-
-        if detection_times:
-            avg_detect = sum(detection_times) / len(detection_times)
-            self._log(f"Average detection time per keyframe: {avg_detect:.2f}s")
-
-        return keyframe_data, keyframe_stats
-
-    def _get_comparison_array(self, image: Image.Image) -> np.ndarray:
-        """Convert image to small grayscale array for fast comparison."""
-        # Downsample to 64x64 grayscale for fast comparison
-        small = image.resize((64, 64), Image.Resampling.BILINEAR).convert('L')
-        return np.array(small, dtype=np.float32)
-
-    def _frame_difference(self, arr1: np.ndarray, arr2: np.ndarray) -> float:
-        """Calculate normalized difference between two frame arrays."""
-        diff = np.abs(arr1 - arr2)
-        return float(np.mean(diff) / 255.0)
-
-    async def _detect_frame(self, frame_bytes: bytes) -> list[dict]:
-        """Run nudity detection on a single frame using configured model(s)."""
-        if self.use_dual_models:
-            # Use both models for maximum coverage
-            detections_320n, detections_640m = await asyncio.gather(
-                self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD),
-                self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
+            await asyncio.to_thread(
+                subprocess.run, extract_cmd, capture_output=True
             )
 
-            # Tag and merge
-            for d in detections_320n:
-                d["model"] = "320n"
-            for d in detections_640m:
-                d["model"] = "640m"
+            # Get frame files
+            frame_files = sorted(frames_dir.glob("frame_*.jpg"))
+            total_frames = len(frame_files)
 
-            all_detections = detections_320n + detections_640m
-            return self.censor._merge_detections(all_detections)
-        else:
-            # Use single model for speed
-            if self.primary_model == "640m":
-                detections = await self.censor.detector_640m.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
-                for d in detections:
-                    d["model"] = "640m"
-            else:
-                detections = await self.censor.detector_320n.detect(frame_bytes, threshold=CENSOR_THRESHOLD)
-                for d in detections:
-                    d["model"] = "320n"
+            if total_frames == 0:
+                raise RuntimeError("No frames extracted from video")
 
-            return self.censor._merge_detections(detections)
+            print(f"[Video] Processing {total_frames} frames...")
 
-    def _extract_censor_boxes(self, detections: list[dict]) -> list[dict]:
-        """Extract boxes that need censoring."""
-        return [
-            {
-                "class": d["class"],
-                "box": d["box"],
-                "score": d["score"]
+            # Process frames in batches
+            stats = {
+                "total_frames": total_frames,
+                "censored_frames": 0,
+                "detections": 0
             }
-            for d in detections
-            if d["class"] in CENSOR_CLASSES
-        ]
 
-    async def _apply_censorship_with_interpolation(
-        self,
-        frame_files: list[Path],
-        keyframe_data: dict[int, dict],
-        output_dir: Path
-    ):
-        """Apply censorship to all frames with smooth box interpolation."""
-        import time
+            for i in range(0, total_frames, VIDEO_BATCH_SIZE):
+                batch = frame_files[i:i + VIDEO_BATCH_SIZE]
 
-        total_frames = len(frame_files)
+                async def process_frame(frame_path: Path) -> tuple[Path, int]:
+                    frame_bytes = frame_path.read_bytes()
+                    censored_bytes, detections = await self.censor.censor_image(
+                        frame_bytes,
+                        use_dual_models=VIDEO_USE_DUAL_MODELS,
+                        primary_model=VIDEO_PRIMARY_MODEL,
+                        threshold=CENSOR_THRESHOLD
+                    )
 
-        if not keyframe_data:
-            # No keyframes = no detections, just copy frames
-            self._log(f"No detections found, copying {total_frames} frames unchanged")
-            for idx, frame_path in enumerate(frame_files):
-                shutil.copy(frame_path, output_dir / f"frame_{idx:06d}.png")
-            return
+                    output_frame = censored_dir / frame_path.name
+                    output_frame.write_bytes(censored_bytes)
 
-        # Get sorted keyframe indices
-        keyframe_indices = sorted(keyframe_data.keys())
+                    return output_frame, len([d for d in detections if d["class"] in CENSOR_CLASSES])
 
-        # Process frames in batches for efficiency
-        batch_size = self.batch_size
-        frame_batches = [
-            (i, frame_files[i:i + batch_size])
-            for i in range(0, len(frame_files), batch_size)
-        ]
+                results = await asyncio.gather(*[process_frame(f) for f in batch])
 
-        total_batches = len(frame_batches)
-        self._log(f"Processing {total_frames} frames in {total_batches} batches (batch_size={batch_size})")
+                for _, detection_count in results:
+                    if detection_count > 0:
+                        stats["censored_frames"] += 1
+                        stats["detections"] += detection_count
 
-        for batch_idx, (start_idx, batch) in enumerate(frame_batches):
-            batch_start = time.time()
-            tasks = []
+            # Reassemble video
+            encode_cmd = [
+                "ffmpeg", "-y",
+                "-framerate", str(target_fps),
+                "-i", str(censored_dir / "frame_%05d.jpg"),
+                "-c:v", "libx264",
+                "-preset", "fast",
+                "-crf", "23",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                str(output_path)
+            ]
 
-            for local_idx, frame_path in enumerate(batch):
-                frame_idx = start_idx + local_idx
-                output_path = output_dir / f"frame_{frame_idx:06d}.png"
+            await asyncio.to_thread(
+                subprocess.run, encode_cmd, capture_output=True
+            )
 
-                # Get interpolated boxes for this frame
-                boxes = self._get_interpolated_boxes(
-                    frame_idx,
-                    keyframe_indices,
-                    keyframe_data
-                )
+            if not output_path.exists():
+                raise RuntimeError("Failed to encode output video")
 
-                tasks.append(
-                    self._process_single_frame(frame_path, output_path, boxes)
-                )
+            output_bytes = output_path.read_bytes()
+            stats["output_size"] = len(output_bytes)
 
-            await asyncio.gather(*tasks)
-
-            # Progress logging
-            if (batch_idx + 1) % max(1, total_batches // 4) == 0 or batch_idx == total_batches - 1:
-                progress = (batch_idx + 1) * 100 // total_batches
-                batch_time = time.time() - batch_start
-                self._log(f"Censorship progress: batch {batch_idx + 1}/{total_batches} ({progress}%), "
-                          f"last batch took {batch_time:.2f}s")
-
-    def _get_interpolated_boxes(
-        self,
-        frame_idx: int,
-        keyframe_indices: list[int],
-        keyframe_data: dict[int, dict]
-    ) -> list[list[int]]:
-        """
-        Get interpolated censor boxes for a specific frame.
-        Smoothly interpolates between keyframes.
-        """
-        # Find surrounding keyframes
-        prev_kf_idx = None
-        next_kf_idx = None
-
-        for kf_idx in keyframe_indices:
-            if kf_idx <= frame_idx:
-                prev_kf_idx = kf_idx
-            if kf_idx >= frame_idx and next_kf_idx is None:
-                next_kf_idx = kf_idx
-                break
-
-        # If we're exactly on a keyframe, use its boxes directly
-        if frame_idx in keyframe_data:
-            return [b["box"] for b in keyframe_data[frame_idx]["boxes"]]
-
-        # If no previous keyframe, use next (shouldn't happen with frame 0 as keyframe)
-        if prev_kf_idx is None:
-            if next_kf_idx is not None:
-                return [b["box"] for b in keyframe_data[next_kf_idx]["boxes"]]
-            return []
-
-        # If no next keyframe, use previous
-        if next_kf_idx is None:
-            return [b["box"] for b in keyframe_data[prev_kf_idx]["boxes"]]
-
-        # Interpolate between prev and next keyframes
-        prev_boxes = keyframe_data[prev_kf_idx]["boxes"]
-        next_boxes = keyframe_data[next_kf_idx]["boxes"]
-
-        # Calculate interpolation factor (0 = prev, 1 = next)
-        if next_kf_idx == prev_kf_idx:
-            t = 0
-        else:
-            t = (frame_idx - prev_kf_idx) / (next_kf_idx - prev_kf_idx)
-
-        # Match boxes between keyframes and interpolate
-        return self._interpolate_box_sets(prev_boxes, next_boxes, t)
-
-    def _interpolate_box_sets(
-        self,
-        prev_boxes: list[dict],
-        next_boxes: list[dict],
-        t: float
-    ) -> list[list[int]]:
-        """
-        Interpolate between two sets of boxes.
-        Matches boxes by class and IoU, then interpolates positions.
-        """
-        result = []
-        used_next = set()
-
-        # For each box in prev, find best match in next
-        for prev_box in prev_boxes:
-            best_match = None
-            best_iou = 0.3  # Minimum IoU to consider a match
-
-            for idx, next_box in enumerate(next_boxes):
-                if idx in used_next:
-                    continue
-                if prev_box["class"] != next_box["class"]:
-                    continue
-
-                iou = self._calculate_iou(prev_box["box"], next_box["box"])
-                if iou > best_iou:
-                    best_iou = iou
-                    best_match = idx
-
-            if best_match is not None:
-                # Interpolate between matched boxes
-                used_next.add(best_match)
-                interpolated = self._interpolate_single_box(
-                    prev_box["box"],
-                    next_boxes[best_match]["box"],
-                    t
-                )
-                result.append(interpolated)
-            else:
-                # No match - box is disappearing, keep it until halfway
-                if t < 0.5:
-                    result.append(prev_box["box"])
-
-        # Add unmatched next boxes (appearing boxes) after halfway
-        if t >= 0.5:
-            for idx, next_box in enumerate(next_boxes):
-                if idx not in used_next:
-                    result.append(next_box["box"])
-
-        return result
-
-    def _interpolate_single_box(
-        self,
-        box1: list[int],
-        box2: list[int],
-        t: float
-    ) -> list[int]:
-        """Linearly interpolate between two boxes."""
-        x1_a, y1_a, w_a, h_a = box1
-        x1_b, y1_b, w_b, h_b = box2
-
-        return [
-            int(x1_a + (x1_b - x1_a) * t),
-            int(y1_a + (y1_b - y1_a) * t),
-            int(w_a + (w_b - w_a) * t),
-            int(h_a + (h_b - h_a) * t),
-        ]
-
-    def _calculate_iou(self, box1: list[int], box2: list[int]) -> float:
-        """Calculate Intersection over Union between two boxes."""
-        x1, y1, w1, h1 = box1
-        x2, y2, w2, h2 = box2
-
-        box1_x2, box1_y2 = x1 + w1, y1 + h1
-        box2_x2, box2_y2 = x2 + w2, y2 + h2
-
-        inter_x1 = max(x1, x2)
-        inter_y1 = max(y1, y2)
-        inter_x2 = min(box1_x2, box2_x2)
-        inter_y2 = min(box1_y2, box2_y2)
-
-        inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-
-        box1_area = w1 * h1
-        box2_area = w2 * h2
-        union_area = box1_area + box2_area - inter_area
-
-        if union_area == 0:
-            return 0
-
-        return inter_area / union_area
-
-    async def _process_single_frame(
-        self,
-        input_path: Path,
-        output_path: Path,
-        boxes: list[list[int]]
-    ):
-        """Apply censor boxes to a single frame and save."""
-        frame_bytes = await asyncio.to_thread(input_path.read_bytes)
-
-        if not boxes:
-            # No censoring needed, just copy
-            await asyncio.to_thread(shutil.copy, input_path, output_path)
-            return
-
-        # Apply black boxes
-        img = Image.open(io.BytesIO(frame_bytes))
-
-        # Convert to RGB if necessary
-        if img.mode in ('RGBA', 'P'):
-            background = Image.new('RGB', img.size, (255, 255, 255))
-            if img.mode == 'P':
-                img = img.convert('RGBA')
-            background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
-            img = background
-        elif img.mode != 'RGB':
-            img = img.convert('RGB')
-
-        draw = ImageDraw.Draw(img)
-
-        for box in boxes:
-            x, y, w, h = box
-            draw.rectangle([x, y, x + w, y + h], fill=(0, 0, 0))
-
-        # Save processed frame
-        await asyncio.to_thread(img.save, output_path, format='PNG')
-
-    async def _encode_video(
-        self,
-        frames_dir: Path,
-        output_path: Path,
-        fps: float,
-        audio_path: Path | None = None
-    ):
-        """Encode processed frames back into a video."""
-        cmd = [
-            "ffmpeg",
-            "-framerate", str(fps),
-            "-i", str(frames_dir / "frame_%06d.png"),
-        ]
-
-        # Add audio if available
-        if audio_path and audio_path.exists():
-            cmd.extend(["-i", str(audio_path)])
-
-        cmd.extend([
-            "-c:v", "libx264",
-            "-preset", "fast",
-            "-crf", "23",  # Good quality
-            "-pix_fmt", "yuv420p",  # Compatibility
-        ])
-
-        # Add audio codec if we have audio
-        if audio_path and audio_path.exists():
-            cmd.extend(["-c:a", "aac", "-b:a", "128k"])
-
-        cmd.extend([
-            "-movflags", "+faststart",  # Web optimization
-            str(output_path),
-            "-y",
-            "-loglevel", "error"
-        ])
-
-        result = await asyncio.to_thread(
-            subprocess.run, cmd, capture_output=True, text=True
-        )
-
-        if result.returncode != 0:
-            raise RuntimeError(f"Video encoding failed: {result.stderr}")
-
-
-# Global video processor instance
-video_processor: VideoProcessor | None = None
+            print(f"[Video] Complete: {stats}")
+            return output_bytes, stats
 
 
 # =============================================================================
-# Database Setup
+# Database Layer
 # =============================================================================
 
 async def init_db():
     """Initialize SQLite database with required tables."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Main GIF cache table
+        # Posts cache - stores Rule34 post metadata
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS gif_cache (
-                id TEXT PRIMARY KEY,
-                thumbnail_url TEXT,
-                hd_url TEXT,
-                sd_url TEXT,
-                web_url TEXT,
+            CREATE TABLE IF NOT EXISTS post_cache (
+                post_id INTEGER PRIMARY KEY,
+                tags TEXT,
+                file_url TEXT,
+                sample_url TEXT,
+                preview_url TEXT,
                 width INTEGER,
                 height INTEGER,
-                duration REAL,
-                tags TEXT,
-                username TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                file_type TEXT,
+                score INTEGER,
+                source TEXT,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
-        # Tag index table - tracks which tags exist and their counts
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS tag_index (
-                tag TEXT PRIMARY KEY,
-                count INTEGER DEFAULT 0,
-                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-
-        # GIF-to-tag mapping for efficient tag-based queries
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS gif_tags (
-                gif_id TEXT,
-                tag TEXT,
-                PRIMARY KEY (gif_id, tag),
-                FOREIGN KEY (gif_id) REFERENCES gif_cache(id)
-            )
-        """)
-
-        # Create index for faster tag lookups
-        await db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_gif_tags_tag ON gif_tags(tag)
-        """)
-
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS captions (
-                gif_id TEXT PRIMARY KEY,
-                caption TEXT,
-                persona TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
+        # Processed media cache - stores censored versions
         await db.execute("""
             CREATE TABLE IF NOT EXISTS processed_media (
-                gif_id TEXT PRIMARY KEY,
-                processed_path TEXT,
-                original_type TEXT,
+                id TEXT PRIMARY KEY,
+                post_id INTEGER,
+                media_type TEXT,
+                file_path TEXT,
                 detections TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                processed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (post_id) REFERENCES post_cache(post_id)
             )
         """)
+
+        # Captions cache
         await db.execute("""
-            CREATE TABLE IF NOT EXISTS processed_videos (
-                gif_id TEXT PRIMARY KEY,
-                processed_path TEXT,
-                quality TEXT,
-                stats TEXT,
-                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            CREATE TABLE IF NOT EXISTS captions (
+                id TEXT PRIMARY KEY,
+                post_id INTEGER,
+                caption TEXT,
+                style TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (post_id) REFERENCES post_cache(post_id)
             )
         """)
+
         await db.commit()
-    print("Database initialized")
+        print("[DB] Database initialized")
 
 
-# =============================================================================
-# RedGifs Client
-# =============================================================================
-
-class RedGifsClient:
-    """Wrapper around the redgifs library."""
-
-    def __init__(self):
-        self._api: redgifs.API | None = None
-        self._lock = asyncio.Lock()
-
-    async def get_api(self) -> redgifs.API:
-        async with self._lock:
-            if self._api is None:
-                self._api = await asyncio.to_thread(self._create_api)
-            return self._api
-
-    def _create_api(self) -> redgifs.API:
-        api = redgifs.API()
-        api.login()
-        return api
-
-    async def get_trending(self, page: int = 1, count: int = 40) -> dict:
-        """
-        Get trending GIFs from RedGifs using get_top_this_week().
-        This is our primary content source - we cache everything and filter by tags locally.
-        """
-        api = await self.get_api()
-        result = await asyncio.to_thread(api.get_top_this_week)
-        return self._parse_search_result(result)
-
-    async def get_gif(self, gif_id: str) -> dict:
-        api = await self.get_api()
-        result = await asyncio.to_thread(api.get_gif, gif_id)
-        return self._parse_gif(result)
-
-    async def download_media(self, gif_id: str) -> tuple[bytes, str]:
-        """Download media for a GIF. Returns (bytes, content_type)."""
-        api = await self.get_api()
-        gif = await asyncio.to_thread(api.get_gif, gif_id)
-        url = gif.urls.thumbnail or gif.urls.poster
-        if not url:
-            raise Exception("No thumbnail available")
-
-        content_type = "image/jpeg"
-        suffix = ".jpg"
-        if url.endswith(".png"):
-            content_type = "image/png"
-            suffix = ".png"
-        elif url.endswith(".gif"):
-            content_type = "image/gif"
-            suffix = ".gif"
-        elif url.endswith(".webp"):
-            content_type = "image/webp"
-            suffix = ".webp"
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp_path = tmp.name
-
-        try:
-            await asyncio.to_thread(api.download, url, tmp_path)
-            media_bytes = await asyncio.to_thread(Path(tmp_path).read_bytes)
-        finally:
-            try:
-                Path(tmp_path).unlink()
-            except Exception:
-                pass
-
-        return media_bytes, content_type
-
-    async def download_video(self, gif_id: str, quality: str = "sd") -> tuple[bytes, str]:
-        """
-        Download video for a GIF. Returns (bytes, content_type).
-
-        Args:
-            gif_id: The GIF ID to download
-            quality: "sd" or "hd"
-        """
-        api = await self.get_api()
-        gif = await asyncio.to_thread(api.get_gif, gif_id)
-
-        # Choose URL based on quality preference
-        if quality == "hd":
-            url = gif.urls.hd or gif.urls.sd
-        else:
-            url = gif.urls.sd or gif.urls.hd
-
-        if not url:
-            raise Exception(f"No video URL available for {gif_id}")
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-            tmp_path = tmp.name
-
-        try:
-            await asyncio.to_thread(api.download, url, tmp_path)
-            video_bytes = await asyncio.to_thread(Path(tmp_path).read_bytes)
-        finally:
-            try:
-                Path(tmp_path).unlink()
-            except Exception:
-                pass
-
-        return video_bytes, "video/mp4"
-
-    def _parse_search_result(self, result) -> dict:
-        return {
-            "page": result.page,
-            "pages": result.pages,
-            "total": result.total,
-            "gifs": [self._parse_gif(gif) for gif in (result.gifs or [])]
-        }
-
-    def _parse_gif(self, gif) -> dict:
-        return {
-            "id": gif.id,
-            "thumbnail_url": gif.urls.thumbnail,
-            "hd_url": gif.urls.hd,
-            "sd_url": gif.urls.sd,
-            "web_url": gif.urls.web_url,
-            "width": getattr(gif, 'width', None),
-            "height": getattr(gif, 'height', None),
-            "duration": getattr(gif, 'duration', None),
-            "tags": getattr(gif, 'tags', []),
-            "username": getattr(gif, 'username', None),
-        }
-
-    async def close(self):
-        if self._api:
-            await asyncio.to_thread(self._api.close)
-            self._api = None
+async def cache_post(post: dict):
+    """Cache a Rule34 post to the database."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("""
+            INSERT OR REPLACE INTO post_cache
+            (post_id, tags, file_url, sample_url, preview_url, width, height, file_type, score, source)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            post["id"],
+            post["tags"],
+            post["file_url"],
+            post["sample_url"],
+            post["preview_url"],
+            post["width"],
+            post["height"],
+            post["file_type"],
+            post["score"],
+            post.get("source", ""),
+        ))
+        await db.commit()
 
 
-# Global client
-redgifs_client = RedGifsClient()
-
-
-# =============================================================================
-# Image Processing
-# =============================================================================
-
-async def process_image(image_bytes: bytes) -> tuple[bytes, list[dict]]:
-    """Process an image by detecting and censoring nudity."""
-    return await nudenet_censor.censor_image(image_bytes)
-
-
-# =============================================================================
-# Caching Functions
-# =============================================================================
-
-async def get_cached_gif(gif_id: str) -> dict | None:
+async def get_cached_post(post_id: int) -> dict | None:
+    """Get a cached post by ID."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("SELECT * FROM gif_cache WHERE id = ?", (gif_id,))
+        cursor = await db.execute(
+            "SELECT * FROM post_cache WHERE post_id = ?",
+            (post_id,)
+        )
         row = await cursor.fetchone()
         if row:
             return dict(row)
-    return None
+        return None
 
 
-async def cache_gif(gif_data: dict):
-    """Cache a GIF and update tag indexes."""
-    gif_id = gif_data["id"]
-    tags = gif_data.get("tags", []) or []
-
+async def cache_processed_media(
+    media_id: str,
+    post_id: int,
+    media_type: str,
+    file_path: str,
+    detections: list[dict]
+):
+    """Cache processed (censored) media."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
-        # Insert/update the main GIF cache
         await db.execute("""
-            INSERT OR REPLACE INTO gif_cache
-            (id, thumbnail_url, hd_url, sd_url, web_url, width, height, duration, tags, username)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO processed_media
+            (id, post_id, media_type, file_path, detections)
+            VALUES (?, ?, ?, ?, ?)
         """, (
-            gif_id,
-            gif_data.get("thumbnail_url"),
-            gif_data.get("hd_url"),
-            gif_data.get("sd_url"),
-            gif_data.get("web_url"),
-            gif_data.get("width"),
-            gif_data.get("height"),
-            gif_data.get("duration"),
-            ",".join(tags),
-            gif_data.get("username"),
+            media_id,
+            post_id,
+            media_type,
+            file_path,
+            json.dumps(detections)
         ))
-
-        # Update gif_tags mapping and tag_index counts
-        for tag in tags:
-            tag_lower = tag.lower().strip()
-            if not tag_lower:
-                continue
-
-            # Check if this gif-tag relationship already exists
-            cursor = await db.execute(
-                "SELECT 1 FROM gif_tags WHERE gif_id = ? AND tag = ?",
-                (gif_id, tag_lower)
-            )
-            exists = await cursor.fetchone()
-
-            if not exists:
-                # Insert new gif-tag relationship
-                await db.execute(
-                    "INSERT OR IGNORE INTO gif_tags (gif_id, tag) VALUES (?, ?)",
-                    (gif_id, tag_lower)
-                )
-
-                # Update tag count (insert or increment)
-                await db.execute("""
-                    INSERT INTO tag_index (tag, count, last_updated)
-                    VALUES (?, 1, CURRENT_TIMESTAMP)
-                    ON CONFLICT(tag) DO UPDATE SET
-                        count = count + 1,
-                        last_updated = CURRENT_TIMESTAMP
-                """, (tag_lower,))
-
         await db.commit()
 
 
-async def get_available_tags(limit: int = 100) -> list[dict]:
-    """Get all available tags with their counts, sorted by count descending."""
+async def get_cached_processed_media(media_id: str) -> dict | None:
+    """Get cached processed media."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        cursor = await db.execute("""
-            SELECT tag, count FROM tag_index
-            WHERE count > 0
-            ORDER BY count DESC
-            LIMIT ?
-        """, (limit,))
-        rows = await cursor.fetchall()
-        return [{"tag": row["tag"], "count": row["count"]} for row in rows]
-
-
-async def get_gifs_by_tag(tag: str, page: int = 1, count: int = 20) -> dict:
-    """Get cached GIFs that have a specific tag."""
-    tag_lower = tag.lower().strip()
-    offset = (page - 1) * count
-
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        db.row_factory = aiosqlite.Row
-
-        # Get total count for this tag
         cursor = await db.execute(
-            "SELECT count FROM tag_index WHERE tag = ?",
-            (tag_lower,)
+            "SELECT * FROM processed_media WHERE id = ?",
+            (media_id,)
         )
-        row = await cursor.fetchone()
-        total = row["count"] if row else 0
-
-        if total == 0:
-            return {
-                "page": page,
-                "pages": 0,
-                "total": 0,
-                "gifs": []
-            }
-
-        # Get GIF IDs for this tag
-        cursor = await db.execute("""
-            SELECT gc.* FROM gif_cache gc
-            INNER JOIN gif_tags gt ON gc.id = gt.gif_id
-            WHERE gt.tag = ?
-            ORDER BY gc.created_at DESC
-            LIMIT ? OFFSET ?
-        """, (tag_lower, count, offset))
-
-        rows = await cursor.fetchall()
-        gifs = []
-        for row in rows:
-            tags_str = row["tags"] or ""
-            gifs.append({
-                "id": row["id"],
-                "thumbnail_url": row["thumbnail_url"],
-                "hd_url": row["hd_url"],
-                "sd_url": row["sd_url"],
-                "web_url": row["web_url"],
-                "width": row["width"],
-                "height": row["height"],
-                "duration": row["duration"],
-                "tags": tags_str.split(",") if tags_str else [],
-                "username": row["username"],
-            })
-
-        pages = (total + count - 1) // count  # Ceiling division
-
-        return {
-            "page": page,
-            "pages": pages,
-            "total": total,
-            "gifs": gifs
-        }
-
-
-async def get_cached_caption(gif_id: str) -> str | None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute("SELECT caption FROM captions WHERE gif_id = ?", (gif_id,))
         row = await cursor.fetchone()
         if row:
-            return row[0]
-    return None
-
-
-async def cache_caption(gif_id: str, caption: str, persona: str):
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO captions (gif_id, caption, persona)
-            VALUES (?, ?, ?)
-        """, (gif_id, caption, persona))
-        await db.commit()
-
-
-async def get_processed_media_path(gif_id: str) -> str | None:
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT processed_path FROM processed_media WHERE gif_id = ?", (gif_id,)
-        )
-        row = await cursor.fetchone()
-        if row and Path(row[0]).exists():
-            return row[0]
-    return None
-
-
-async def cache_processed_media(gif_id: str, processed_bytes: bytes, detections: list[dict]) -> str:
-    filename = f"{hashlib.md5(gif_id.encode()).hexdigest()}.jpg"
-    filepath = MEDIA_CACHE_DIR / filename
-    await asyncio.to_thread(filepath.write_bytes, processed_bytes)
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO processed_media (gif_id, processed_path, original_type, detections)
-            VALUES (?, ?, ?, ?)
-        """, (gif_id, str(filepath), "image/jpeg", json.dumps(detections)))
-        await db.commit()
-    return str(filepath)
-
-
-async def get_processed_video_path(gif_id: str, quality: str = "sd") -> str | None:
-    """Get path to cached processed video if it exists."""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT processed_path FROM processed_videos WHERE gif_id = ? AND quality = ?",
-            (gif_id, quality)
-        )
-        row = await cursor.fetchone()
-        if row and Path(row[0]).exists():
-            return row[0]
-    return None
-
-
-async def cache_processed_video(
-    gif_id: str,
-    processed_bytes: bytes,
-    quality: str,
-    stats: dict
-) -> str:
-    """Cache a processed video and return its path."""
-    filename = f"{hashlib.md5(f'{gif_id}_{quality}'.encode()).hexdigest()}.mp4"
-    filepath = VIDEO_CACHE_DIR / filename
-    await asyncio.to_thread(filepath.write_bytes, processed_bytes)
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        await db.execute("""
-            INSERT OR REPLACE INTO processed_videos (gif_id, processed_path, quality, stats)
-            VALUES (?, ?, ?, ?)
-        """, (gif_id, str(filepath), quality, json.dumps(stats)))
-        await db.commit()
-    return str(filepath)
-
-
-async def get_video_processing_stats(gif_id: str, quality: str = "sd") -> dict | None:
-    """Get processing stats for a cached video."""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT stats FROM processed_videos WHERE gif_id = ? AND quality = ?",
-            (gif_id, quality)
-        )
-        row = await cursor.fetchone()
-        if row and row[0]:
-            return json.loads(row[0])
-    return None
+            result = dict(row)
+            result["detections"] = json.loads(result["detections"])
+            return result
+        return None
 
 
 # =============================================================================
-# Poe Bot Implementation
+# Media Processing Service
 # =============================================================================
 
-class SuperBrowserBot(fp.PoeBot):
-    """Poe bot that handles browsing and processing RedGifs content."""
+class MediaProcessor:
+    """Service for processing and serving censored media."""
 
-    async def get_response(
-        self, request: fp.QueryRequest
-    ) -> AsyncIterable[fp.PartialResponse]:
-        """Handle incoming messages from Poe."""
-        last_message = request.query[-1].content.strip()
+    def __init__(self, censor: NudeNetCensor, rule34: Rule34Client):
+        self.censor = censor
+        self.rule34 = rule34
+        self.video_processor = VideoCensorProcessor(censor)
+        self._http_client: httpx.AsyncClient | None = None
 
-        parts = last_message.split()
-        command = parts[0].lower() if parts else "help"
-        args = parts[1:] if len(parts) > 1 else []
-
-        try:
-            if command == "browse":
-                async for response in self._handle_browse(args):
-                    yield response
-            elif command == "trending":
-                # Alias for browse with no tag
-                async for response in self._handle_browse(args):
-                    yield response
-            elif command == "tags":
-                async for response in self._handle_tags(args):
-                    yield response
-            elif command == "item":
-                async for response in self._handle_item(args):
-                    yield response
-            elif command == "help":
-                yield fp.PartialResponse(text=self._get_help_text())
-            else:
-                # Treat unknown command as a tag to browse
-                async for response in self._handle_browse([command] + args):
-                    yield response
-
-        except Exception as e:
-            yield fp.PartialResponse(text=f"Error: {str(e)}")
-
-    async def _handle_browse(self, args: list[str]) -> AsyncIterable[fp.PartialResponse]:
-        """
-        Handle browse command.
-
-        - No args: Get trending content from RedGifs (cached for future tag filtering)
-        - With tag: Filter locally cached content by that tag
-
-        Usage: browse [tag] [page]
-        """
-        page = 1
-        count = 20
-        tag = None
-
-        # Parse arguments
-        for arg in args:
-            if arg.isdigit():
-                page = int(arg)
-            else:
-                tag = arg
-
-        if tag:
-            # Filter by tag from local cache
-            yield fp.PartialResponse(text=f"🏷️ Filtering cached content for **{tag}** (page {page})...\n\n")
-
-            result = await get_gifs_by_tag(tag, page=page, count=count)
-
-            if result["total"] == 0:
-                # Get available tags to suggest alternatives
-                available_tags = await get_available_tags(20)
-                tag_list = ", ".join([f"`{t['tag']}` ({t['count']})" for t in available_tags[:10]])
-                yield fp.PartialResponse(
-                    text=f"No cached content found for tag **{tag}**.\n\n"
-                    f"Available tags: {tag_list if tag_list else 'None yet - browse trending first!'}\n\n"
-                    "Use `browse` (no tag) to fetch trending content and build up the cache."
-                )
-                return
-
-            response_data = {
-                "type": "browse_result",
-                "source": "cache",
-                "tag": tag,
-                "page": result["page"],
-                "pages": result["pages"],
-                "total": result["total"],
-                "items": []
-            }
-
-            for gif in result["gifs"]:
-                media_url = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
-                response_data["items"].append({
-                    "id": gif["id"],
-                    "thumbnail_url": gif["thumbnail_url"],
-                    "hd_url": gif["hd_url"],
-                    "sd_url": gif["sd_url"],
-                    "web_url": gif["web_url"],
-                    "media_url": media_url,
-                    "video_url": f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None,
-                    "username": gif.get("username"),
-                    "tags": gif.get("tags", []),
-                })
-
-        else:
-            # Fetch trending from RedGifs and cache it
-            yield fp.PartialResponse(text=f"🔥 Fetching trending content (page {page})...\n\n")
-
-            try:
-                result = await redgifs_client.get_trending(page=page, count=count)
-            except Exception as e:
-                yield fp.PartialResponse(text=f"Error fetching from RedGifs: {str(e)}")
-                return
-
-            # Cache all GIFs and their tags
-            for gif in result["gifs"]:
-                await cache_gif(gif)
-
-            response_data = {
-                "type": "browse_result",
-                "source": "trending",
-                "page": result["page"],
-                "pages": result["pages"],
-                "total": result["total"],
-                "items": []
-            }
-
-            for gif in result["gifs"]:
-                media_url = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
-                response_data["items"].append({
-                    "id": gif["id"],
-                    "thumbnail_url": gif["thumbnail_url"],
-                    "hd_url": gif["hd_url"],
-                    "sd_url": gif["sd_url"],
-                    "web_url": gif["web_url"],
-                    "media_url": media_url,
-                    "video_url": f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None,
-                    "username": gif.get("username"),
-                    "tags": gif.get("tags", []),
-                })
-
-        yield fp.PartialResponse(text=f"```json\n{json.dumps(response_data, indent=2)}\n```")
-
-    async def _handle_tags(self, args: list[str]) -> AsyncIterable[fp.PartialResponse]:
-        """
-        Handle tags command - list available tags from the cache.
-
-        Usage: tags [limit]
-        """
-        limit = 50  # Default limit
-        for arg in args:
-            if arg.isdigit():
-                limit = min(int(arg), 200)  # Cap at 200
-
-        yield fp.PartialResponse(text="🏷️ Fetching available tags from cache...\n\n")
-
-        tags = await get_available_tags(limit)
-
-        if not tags:
-            yield fp.PartialResponse(
-                text="No tags cached yet.\n\n"
-                "Use `browse` or `trending` to fetch content from RedGifs and build up the tag cache."
+    @property
+    def http_client(self) -> httpx.AsyncClient:
+        if self._http_client is None:
+            self._http_client = httpx.AsyncClient(
+                timeout=60.0,
+                follow_redirects=True,
+                headers={"User-Agent": "SuperBrowser/1.0"}
             )
-            return
+        return self._http_client
 
-        response_data = {
-            "type": "tags_result",
-            "total": len(tags),
-            "tags": tags
-        }
+    async def close(self):
+        if self._http_client:
+            await self._http_client.aclose()
+            self._http_client = None
+        await self.video_processor.close()
 
-        yield fp.PartialResponse(text=f"```json\n{json.dumps(response_data, indent=2)}\n```")
+    def _generate_media_id(self, post_id: int) -> str:
+        """Generate a unique ID for processed media."""
+        return f"r34_{post_id}"
 
-    async def _handle_item(self, args: list[str]) -> AsyncIterable[fp.PartialResponse]:
-        """Handle item command."""
-        if not args:
-            yield fp.PartialResponse(text="Please specify a GIF ID. Example: `item abcxyz123`")
-            return
+    async def get_or_process_media(self, post_id: int) -> tuple[str, str]:
+        """
+        Get or process censored media for a post.
 
-        gif_id = args[0]
+        Returns:
+            Tuple of (file_path, media_type)
+        """
+        media_id = self._generate_media_id(post_id)
 
-        yield fp.PartialResponse(text=f"📦 Loading item **{gif_id}**...\n\n")
+        # Check cache first
+        cached = await get_cached_processed_media(media_id)
+        if cached and Path(cached["file_path"]).exists():
+            print(f"[Media] Cache hit for post {post_id}")
+            return cached["file_path"], cached["media_type"]
 
-        gif_data = await get_cached_gif(gif_id)
-        if not gif_data:
-            try:
-                gif_data = await redgifs_client.get_gif(gif_id)
-                await cache_gif(gif_data)
-            except Exception as e:
-                yield fp.PartialResponse(text=f"Error: Could not find GIF {gif_id}: {str(e)}")
-                return
+        # Get post info
+        post = await get_cached_post(post_id)
+        if not post:
+            post = await self.rule34.get_post_by_id(post_id)
+            if not post:
+                raise ValueError(f"Post {post_id} not found")
+            await cache_post(post)
 
-        caption = await get_cached_caption(gif_id)
-        if not caption:
-            caption = "A captivating moment captured in pixels! ✨"
-            await cache_caption(gif_id, caption, "default")
+        file_url = post["file_url"]
+        file_type = post["file_type"]
 
-        media_url = f"{SERVER_URL}/media/{gif_id}" if SERVER_URL else None
+        print(f"[Media] Processing post {post_id} ({file_type}): {file_url}")
 
-        response_data = {
-            "type": "item_result",
-            "id": gif_id,
-            "thumbnail_url": gif_data.get("thumbnail_url"),
-            "hd_url": gif_data.get("hd_url"),
-            "sd_url": gif_data.get("sd_url"),
-            "web_url": gif_data.get("web_url"),
-            "media_url": media_url,
-            "video_url": f"{SERVER_URL}/video/{gif_id}" if SERVER_URL else None,
-            "caption": caption,
-            "username": gif_data.get("username"),
-            "tags": gif_data.get("tags", "").split(",") if isinstance(gif_data.get("tags"), str) else gif_data.get("tags", []),
-        }
+        # Download original
+        response = await self.http_client.get(file_url)
+        response.raise_for_status()
+        original_bytes = response.content
 
-        yield fp.PartialResponse(text=f"```json\n{json.dumps(response_data, indent=2)}\n```")
+        # Process based on type
+        if file_type == "video":
+            # Process video
+            processed_bytes, stats = await self.video_processor.process_video(original_bytes)
+            extension = "mp4"
+            media_type = "video"
+            detections = [{"stats": stats}]
+        elif file_type == "gif":
+            # Process GIF as video
+            processed_bytes, stats = await self.video_processor.process_video(
+                original_bytes, output_format="mp4"
+            )
+            extension = "mp4"
+            media_type = "gif"
+            detections = [{"stats": stats}]
+        else:
+            # Process image
+            processed_bytes, detections = await self.censor.censor_image(
+                original_bytes,
+                threshold=CENSOR_THRESHOLD
+            )
+            extension = "jpg"
+            media_type = "image"
 
-    def _get_help_text(self) -> str:
-        return """
-# Super Browser Bot 🌐
+        # Save to cache directory
+        file_path = MEDIA_CACHE_DIR / f"{media_id}.{extension}"
+        file_path.write_bytes(processed_bytes)
 
-**Commands:**
-
-- `browse` or `trending` - Get trending content from RedGifs
-  - Automatically caches all content and their tags
-  - Use `browse 2`, `browse 3`, etc. for more pages
-  - Examples:
-    - `browse` - Get page 1 of trending
-    - `trending 5` - Get page 5 of trending
-
-- `browse <tag> [page]` or just `<tag> [page]` - Filter cached content by tag
-  - Only searches content already cached from trending
-  - Examples:
-    - `browse blonde` - Cached content tagged "blonde"
-    - `amateur 2` - Page 2 of cached "amateur" content
-    - `milf` - Cached content tagged "milf"
-
-- `tags [limit]` - List available tags from cache with counts
-  - Shows which tags have cached content
-  - Example: `tags 50` - Top 50 tags by count
-
-- `item <gif_id>` - Get a specific item with caption
-  - Example: `item abcxyz123`
-
-- `help` - Show this help message
-
-**How It Works:**
-1. Use `browse` (no tag) to fetch trending content
-2. Content is automatically cached with all its tags
-3. Use `tags` to see what's available
-4. Use `browse <tag>` to filter cached content by tag
-
-**Features:**
-- 🔒 Dual-model AI nudity censoring (320n + 640m)
-- 📦 Processed images served from `/media/{id}`
-- 🎬 **NEW: Video censoring** served from `/video/{id}`
-  - Smart keyframe detection (scene changes)
-  - Smooth censor box interpolation between keyframes
-  - Audio preserved
-  - First request takes 10-60s to process, then cached
-- 🏷️ Local tag filtering (more reliable than API search)
-- 💾 All content cached for instant tag-based browsing
-
-**For Canvas Apps:**
-Responses are returned as JSON in code blocks for easy parsing.
-Each item includes `media_url` (censored thumbnail) and `video_url` (censored video).
-"""
-
-    async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
-        """Return bot settings."""
-        return fp.SettingsResponse(
-            server_bot_dependencies={},
-            introduction_message="Welcome to Super Browser! 🌐\n\n"
-            "**Quick Start:**\n"
-            "• `browse` - Get trending content (builds cache)\n"
-            "• `tags` - See available tags with counts\n"
-            "• `browse <tag>` - Filter cached content by tag\n\n"
-            "🔒 All images AND videos are processed with automated nudity censoring.\n"
-            "🎬 Video censoring uses smart keyframe detection with smooth interpolation.\n\n"
-            "Type `help` for more commands.",
+        # Cache metadata
+        await cache_processed_media(
+            media_id=media_id,
+            post_id=post_id,
+            media_type=media_type,
+            file_path=str(file_path),
+            detections=detections
         )
 
+        print(f"[Media] Saved processed media: {file_path}")
+        return str(file_path), media_type
+
 
 # =============================================================================
-# FastAPI Application
+# Global Instances
 # =============================================================================
 
-bot = SuperBrowserBot()
+rule34_client: Rule34Client | None = None
+censor: NudeNetCensor | None = None
+media_processor: MediaProcessor | None = None
 
-app = fp.make_app(
-    bot,
-    access_key=POE_ACCESS_KEY if POE_ACCESS_KEY else None,
-    bot_name=BOT_NAME,
-    allow_without_key=not POE_ACCESS_KEY,
-)
+
+# =============================================================================
+# FastAPI App
+# =============================================================================
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifecycle manager for FastAPI app."""
+    global rule34_client, censor, media_processor
+
+    print("=" * 60)
+    print("Super Browser - Starting up...")
+    print("=" * 60)
+
+    # Initialize database
+    await init_db()
+
+    # Initialize Rule34 client
+    rule34_client = Rule34Client()
+
+    # Initialize NudeNet censor
+    censor = NudeNetCensor()
+    await censor.load()
+
+    # Initialize media processor
+    media_processor = MediaProcessor(censor, rule34_client)
+
+    print("=" * 60)
+    print("Super Browser - Ready!")
+    print("=" * 60)
+
+    yield
+
+    # Cleanup
+    print("Shutting down...")
+    if rule34_client:
+        await rule34_client.close()
+    if media_processor:
+        await media_processor.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -2043,310 +1165,196 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-original_lifespan = app.router.lifespan_context
-
-
-@asynccontextmanager
-async def combined_lifespan(app: FastAPI):
-    global video_processor
-    await init_db()
-    print("Pre-loading NudeNet ONNX model...")
-    await nudenet_censor.load()
-    print("NudeNet model ready!")
-    # Initialize video processor
-    video_processor = VideoProcessor(nudenet_censor)
-    print("Video processor initialized!")
-    async with original_lifespan(app):
-        yield
-    await redgifs_client.close()
-
-
-app.router.lifespan_context = combined_lifespan
-
 
 # =============================================================================
-# REST Endpoints
+# REST API Endpoints
 # =============================================================================
 
-@app.get("/")
-async def root():
-    """Health check."""
-    # Get tag stats
-    tags = await get_available_tags(limit=5)
-    total_tags_result = await get_available_tags(limit=10000)
-    total_tags = len(total_tags_result)
-
-    # Check ffmpeg availability
-    ffmpeg_available = False
-    ffmpeg_version = None
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            ffmpeg_available = True
-            # Extract version from first line
-            first_line = result.stdout.split('\n')[0] if result.stdout else ""
-            ffmpeg_version = first_line
-    except Exception:
-        pass
-
-    return {
-        "status": "ok",
-        "service": "Super Browser Bot",
-        "features": {
-            "nudity_censoring": True,
-            "dual_model": True,
-            "models": ["NudeNet 320n", "NudeNet 640m"],
-            "censor_threshold": CENSOR_THRESHOLD,
-            "local_tag_filtering": True,
-            "video_processing": ffmpeg_available,
-            "ffmpeg_available": ffmpeg_available,
-            "ffmpeg_version": ffmpeg_version,
-            "video_features": {
-                "smart_keyframes": True,
-                "scene_change_detection": True,
-                "smooth_box_interpolation": True,
-                "keyframe_interval_seconds": VIDEO_KEYFRAME_INTERVAL_SECONDS,
-                "scene_change_threshold": VIDEO_SCENE_CHANGE_THRESHOLD,
-                "max_duration_seconds": VIDEO_MAX_DURATION,
-                "target_fps": VIDEO_TARGET_FPS,
-                "use_dual_models": VIDEO_USE_DUAL_MODELS,
-                "primary_model": VIDEO_PRIMARY_MODEL,
-                "batch_size": VIDEO_BATCH_SIZE,
-                "verbose_logging": VIDEO_VERBOSE_LOGGING,
-            } if ffmpeg_available else None,
-        },
-        "cache_stats": {
-            "total_tags": total_tags,
-            "top_tags": tags[:5] if tags else [],
-        },
-        "endpoints": {
-            "/tags": "GET - List all cached tags with counts",
-            "/browse/tag/{tag}": "GET - Get cached GIFs by tag",
-            "/media/{gif_id}": "GET - Get processed (censored) thumbnail image",
-            "/video/{gif_id}": "GET - Get processed (censored) video (query: quality=sd|hd)" if ffmpeg_available else "UNAVAILABLE - ffmpeg not installed",
-            "/video/{gif_id}/status": "GET - Check video processing status",
-        }
-    }
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {"status": "ok", "service": "super-browser"}
 
 
-@app.get("/media/{gif_id}")
-async def get_processed_media(gif_id: str):
-    """Serve processed media with nudity censored."""
-    cached_path = await get_processed_media_path(gif_id)
-    if cached_path:
-        return FileResponse(cached_path, media_type="image/jpeg")
+@app.get("/tags/popular")
+async def get_popular_tags(
+    limit: int = Query(50, ge=1, le=100),
+    order_by: str = Query("updated", regex="^(count|updated)$")
+):
+    """Get popular/trending tags."""
+    if not rule34_client:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
-    try:
-        original_bytes, _ = await redgifs_client.download_media(gif_id)
-    except Exception as e:
-        return Response(content=f"Error downloading: {e}", status_code=404)
-
-    try:
-        processed_bytes, detections = await process_image(original_bytes)
-    except Exception as e:
-        return Response(content=f"Error processing: {e}", status_code=500)
-
-    filepath = await cache_processed_media(gif_id, processed_bytes, detections)
-
-    return FileResponse(filepath, media_type="image/jpeg")
+    tags = await rule34_client.get_popular_tags(limit=limit, order_by=order_by)
+    return {"tags": tags}
 
 
-@app.get("/media/{gif_id}/detections")
-async def get_media_detections(gif_id: str):
-    """Get detection results for a processed media item."""
-    async with aiosqlite.connect(DATABASE_PATH) as db:
-        cursor = await db.execute(
-            "SELECT detections FROM processed_media WHERE gif_id = ?", (gif_id,)
-        )
-        row = await cursor.fetchone()
-        if row and row[0]:
-            return {"gif_id": gif_id, "detections": json.loads(row[0])}
+@app.get("/tags/autocomplete")
+async def autocomplete_tags(
+    q: str = Query(..., min_length=2),
+    limit: int = Query(20, ge=1, le=50)
+):
+    """Autocomplete tag search."""
+    if not rule34_client:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
-    return {"gif_id": gif_id, "detections": None, "message": "Not processed yet"}
-
-
-@app.get("/tags")
-async def list_tags(limit: int = 100):
-    """Get available tags from cache with counts."""
-    tags = await get_available_tags(limit=min(limit, 500))
-    return {
-        "total": len(tags),
-        "tags": tags
-    }
+    suggestions = await rule34_client.autocomplete_tags(query=q, limit=limit)
+    return {"suggestions": suggestions}
 
 
-@app.get("/browse/tag/{tag}")
-async def browse_by_tag(tag: str, page: int = 1, count: int = 20):
-    """Get cached GIFs by tag."""
-    result = await get_gifs_by_tag(tag, page=page, count=count)
+@app.get("/posts")
+async def get_posts(
+    tags: str = Query(..., min_length=1),
+    limit: int = Query(50, ge=1, le=100),
+    page: int = Query(0, ge=0),
+    sort: str = Query("score", regex="^(score|id)$")
+):
+    """Get posts for given tags."""
+    if not rule34_client:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
-    # Add media_url and video_url to each gif
-    for gif in result["gifs"]:
-        gif["media_url"] = f"{SERVER_URL}/media/{gif['id']}" if SERVER_URL else None
-        gif["video_url"] = f"{SERVER_URL}/video/{gif['id']}" if SERVER_URL else None
-
-    return {
-        "source": "cache",
-        "tag": tag,
-        **result
-    }
-
-
-def check_ffmpeg_available() -> tuple[bool, str]:
-    """Check if ffmpeg and ffprobe are available."""
-    try:
-        result = subprocess.run(
-            ["ffmpeg", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode != 0:
-            return False, "ffmpeg not working"
-
-        result = subprocess.run(
-            ["ffprobe", "-version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
-        if result.returncode != 0:
-            return False, "ffprobe not working"
-
-        return True, "ffmpeg available"
-    except FileNotFoundError:
-        return False, "ffmpeg/ffprobe not installed. Video processing requires ffmpeg."
-    except Exception as e:
-        return False, f"ffmpeg check failed: {e}"
-
-
-@app.get("/video/{gif_id}")
-async def get_processed_video(gif_id: str, quality: str = "sd"):
-    """
-    Serve processed video with nudity censored.
-
-    This endpoint downloads the video, processes it frame-by-frame with
-    smart keyframe detection and smooth box interpolation, then serves
-    the censored result.
-
-    Query params:
-        quality: "sd" (default) or "hd"
-
-    Note: First request for a video will take 10-60 seconds to process.
-    Subsequent requests are served from cache.
-    """
-    global video_processor
-
-    # Check ffmpeg availability
-    ffmpeg_ok, ffmpeg_msg = check_ffmpeg_available()
-    if not ffmpeg_ok:
-        return Response(
-            content=f"Video processing unavailable: {ffmpeg_msg}",
-            status_code=503
-        )
-
-    if video_processor is None:
-        return Response(
-            content="Video processor not initialized",
-            status_code=503
-        )
-
-    # Validate quality param
-    if quality not in ("sd", "hd"):
-        quality = "sd"
-
-    # Check cache first
-    cached_path = await get_processed_video_path(gif_id, quality)
-    if cached_path:
-        return FileResponse(
-            cached_path,
-            media_type="video/mp4",
-            headers={
-                "X-Cache": "HIT",
-                "X-Processing-Time": "0"
-            }
-        )
-
-    # Download the video
-    try:
-        print(f"Downloading video {gif_id} ({quality})...")
-        video_bytes, _ = await redgifs_client.download_video(gif_id, quality)
-        print(f"Downloaded {len(video_bytes) / 1024 / 1024:.1f} MB")
-    except Exception as e:
-        return Response(
-            content=f"Error downloading video: {e}",
-            status_code=404
-        )
-
-    # Process the video
-    try:
-        print(f"Processing video {gif_id}...")
-        processed_bytes, stats = await video_processor.process_video(video_bytes, quality)
-        print(f"Video processed: {stats}")
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return Response(
-            content=f"Error processing video: {e}",
-            status_code=500
-        )
-
-    # Cache the result
-    filepath = await cache_processed_video(gif_id, processed_bytes, quality, stats)
-
-    return FileResponse(
-        filepath,
-        media_type="video/mp4",
-        headers={
-            "X-Cache": "MISS",
-            "X-Processing-Time": str(stats.get("processing_time_seconds", 0)),
-            "X-Keyframes": str(stats.get("keyframes_detected", 0)),
-            "X-Total-Frames": str(stats.get("total_frames", 0)),
-        }
+    posts = await rule34_client.get_posts(
+        tags=tags,
+        limit=limit,
+        page=page,
+        sort=sort
     )
 
+    # Cache posts
+    for post in posts:
+        await cache_post(post)
 
-@app.get("/video/{gif_id}/status")
-async def get_video_status(gif_id: str, quality: str = "sd"):
-    """
-    Check if a processed video exists in cache and get its stats.
-    Useful for checking status before requesting a potentially long processing job.
-    """
-    if quality not in ("sd", "hd"):
-        quality = "sd"
+    return {"posts": posts, "count": len(posts)}
 
-    cached_path = await get_processed_video_path(gif_id, quality)
 
-    if cached_path:
-        stats = await get_video_processing_stats(gif_id, quality)
+@app.get("/posts/{post_id}")
+async def get_post(post_id: int):
+    """Get a single post by ID."""
+    if not rule34_client:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+
+    # Check cache first
+    post = await get_cached_post(post_id)
+    if not post:
+        post = await rule34_client.get_post_by_id(post_id)
+        if not post:
+            return JSONResponse({"error": "Post not found"}, status_code=404)
+        await cache_post(post)
+
+    return {"post": post}
+
+
+@app.get("/media/{post_id}")
+async def get_media(post_id: int):
+    """Get censored media for a post."""
+    if not media_processor:
+        return JSONResponse({"error": "Service not initialized"}, status_code=503)
+
+    try:
+        file_path, media_type = await media_processor.get_or_process_media(post_id)
+
+        # Determine content type
+        if media_type == "video" or media_type == "gif":
+            content_type = "video/mp4"
+        else:
+            content_type = "image/jpeg"
+
+        return FileResponse(
+            file_path,
+            media_type=content_type,
+            filename=f"r34_{post_id}.{file_path.split('.')[-1]}"
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+    except Exception as e:
+        print(f"[Media] Error processing {post_id}: {e}")
+        return JSONResponse({"error": "Processing failed"}, status_code=500)
+
+
+@app.get("/media/{post_id}/status")
+async def get_media_status(post_id: int):
+    """Check if media has been processed."""
+    media_id = f"r34_{post_id}"
+    cached = await get_cached_processed_media(media_id)
+
+    if cached and Path(cached["file_path"]).exists():
         return {
-            "gif_id": gif_id,
-            "quality": quality,
-            "status": "ready",
-            "cached": True,
-            "stats": stats,
-            "video_url": f"{SERVER_URL}/video/{gif_id}?quality={quality}" if SERVER_URL else None
+            "processed": True,
+            "media_type": cached["media_type"],
+            "url": f"{SERVER_URL}/media/{post_id}" if SERVER_URL else f"/media/{post_id}"
         }
 
-    return {
-        "gif_id": gif_id,
-        "quality": quality,
-        "status": "not_processed",
-        "cached": False,
-        "message": "Video has not been processed yet. Request /video/{gif_id} to trigger processing."
-    }
+    return {"processed": False}
 
 
 # =============================================================================
-# Entry Point
+# Poe Bot Handler
+# =============================================================================
+
+class SuperBrowserBot(fp.PoeBot):
+    """Poe bot for browsing Rule34 content."""
+
+    async def get_response(
+        self, request: fp.QueryRequest
+    ) -> AsyncIterable[fp.PartialResponse]:
+        """Handle incoming bot requests."""
+        query = request.query[-1].content.strip().lower()
+
+        # Simple command routing
+        if query.startswith("/tags"):
+            tags = await rule34_client.get_popular_tags(limit=20)
+            tag_list = "\n".join([f"- **{t['name']}** ({t['count']:,} posts)" for t in tags[:20]])
+            yield fp.PartialResponse(text=f"## Trending Tags\n\n{tag_list}")
+
+        elif query.startswith("/search "):
+            search_term = query[8:].strip()
+            posts = await rule34_client.get_posts(tags=search_term, limit=10)
+
+            if not posts:
+                yield fp.PartialResponse(text=f"No posts found for: {search_term}")
+                return
+
+            response = f"## Results for: {search_term}\n\n"
+            for post in posts:
+                response += f"- Post #{post['id']} (score: {post['score']}) - {post['file_type']}\n"
+
+            yield fp.PartialResponse(text=response)
+
+        else:
+            yield fp.PartialResponse(text="""
+## Super Browser
+
+Commands:
+- `/tags` - View trending tags
+- `/search <tag>` - Search posts by tag
+
+Use the canvas app for the full browsing experience!
+            """)
+
+    async def get_settings(self, setting: fp.SettingsRequest) -> fp.SettingsResponse:
+        """Return bot settings."""
+        return fp.SettingsResponse(
+            server_bot_dependencies={},
+            introduction_message="Welcome to Super Browser! Use /tags to see trending content.",
+        )
+
+
+poe_bot = SuperBrowserBot()
+
+
+# Mount Poe bot endpoint
+app.add_api_route(
+    "/poe",
+    fp.make_app(poe_bot, access_key=POE_ACCESS_KEY).routes[0].endpoint,
+    methods=["POST"]
+)
+
+
+# =============================================================================
+# Main Entry Point
 # =============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
+    port = int(os.getenv("PORT", "8080"))
     uvicorn.run(app, host="0.0.0.0", port=port)
