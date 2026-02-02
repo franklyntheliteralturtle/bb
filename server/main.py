@@ -47,6 +47,8 @@ SERVER_URL = os.getenv("SERVER_URL", "")
 RULE34_API_BASE = "https://api.rule34.xxx/index.php"
 RULE34_AUTOCOMPLETE_BASE = "https://autocomplete.rule34.xxx/autocomplete.php"
 RULE34_TAG_CACHE_TTL = int(os.getenv("RULE34_TAG_CACHE_TTL", "300"))  # 5 minutes default
+RULE34_API_KEY = os.getenv("RULE34_API_KEY", "")
+RULE34_USER_ID = os.getenv("RULE34_USER_ID", "")
 
 # NudeNet model URLs - using dual models for better coverage
 NUDENET_320N_URLS = [
@@ -136,6 +138,13 @@ class Rule34Client:
             )
         return self._http_client
 
+    def _add_auth_params(self, params: dict) -> dict:
+        """Add authentication parameters to API request."""
+        if RULE34_API_KEY and RULE34_USER_ID:
+            params["api_key"] = RULE34_API_KEY
+            params["user_id"] = RULE34_USER_ID
+        return params
+
     async def close(self):
         if self._http_client:
             await self._http_client.aclose()
@@ -161,14 +170,14 @@ class Rule34Client:
                     print(f"[Rule34] Returning cached tags for {cache_key}")
                     return cached_data
 
-        params = {
+        params = self._add_auth_params({
             "page": "dapi",
             "s": "tag",
             "q": "index",
             "json": "1",
             "limit": min(limit, 100),
             "orderby": order_by,
-        }
+        })
 
         try:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
@@ -251,9 +260,11 @@ class Rule34Client:
                     return cached_data[:limit]
 
         try:
+            # Autocomplete endpoint may also need auth
+            params = self._add_auth_params({"q": query})
             response = await self.http_client.get(
                 RULE34_AUTOCOMPLETE_BASE,
-                params={"q": query}
+                params=params
             )
             response.raise_for_status()
 
@@ -309,7 +320,7 @@ class Rule34Client:
         elif sort == "id":
             search_tags = f"sort:id:desc {tags}"
 
-        params = {
+        params = self._add_auth_params({
             "page": "dapi",
             "s": "post",
             "q": "index",
@@ -317,7 +328,7 @@ class Rule34Client:
             "limit": min(limit, 1000),
             "pid": page,
             "tags": search_tags,
-        }
+        })
 
         try:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
@@ -372,13 +383,13 @@ class Rule34Client:
 
     async def get_post_by_id(self, post_id: int) -> dict | None:
         """Get a single post by ID."""
-        params = {
+        params = self._add_auth_params({
             "page": "dapi",
             "s": "post",
             "q": "index",
             "json": "1",
             "id": post_id,
-        }
+        })
 
         try:
             response = await self.http_client.get(RULE34_API_BASE, params=params)
