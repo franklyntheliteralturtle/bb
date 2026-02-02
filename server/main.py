@@ -51,6 +51,14 @@ RULE34_TAG_CACHE_TTL = int(os.getenv("RULE34_TAG_CACHE_TTL", "300"))  # 5 minute
 RULE34_API_KEY = os.getenv("RULE34_API_KEY", "")
 RULE34_USER_ID = os.getenv("RULE34_USER_ID", "")
 
+# Hardcoded popular tags (Rule34's tag API ordering is unreliable)
+POPULAR_TAGS = [
+    "breasts",
+    "femdom",
+    "feet",
+    "genshin_impact",
+]
+
 # NudeNet model URLs - using dual models for better coverage
 NUDENET_320N_URLS = [
     "https://huggingface.co/deepghs/nudenet_onnx/resolve/main/320n.onnx",
@@ -1276,16 +1284,9 @@ async def health_check():
 
 
 @app.get("/tags/popular")
-async def get_popular_tags(
-    limit: int = Query(50, ge=1, le=100),
-    order_by: str = Query("count", regex="^(count|updated)$")
-):
-    """Get popular tags (by post count) or recently updated tags."""
-    if not rule34_client:
-        return JSONResponse({"error": "Service not initialized"}, status_code=503)
-
-    tags = await rule34_client.get_popular_tags(limit=limit, order_by=order_by)
-    return {"tags": tags}
+async def get_popular_tags_endpoint():
+    """Get hardcoded popular tags list."""
+    return {"tags": [{"name": tag, "type": "general"} for tag in POPULAR_TAGS]}
 
 
 @app.get("/tags/autocomplete")
@@ -1401,9 +1402,8 @@ class SuperBrowserBot(fp.PoeBot):
 
         # Simple command routing
         if query.startswith("/tags"):
-            # Use order_by="count" for popular tags (most posts)
-            tags = await rule34_client.get_popular_tags(limit=20, order_by="count")
-            tag_list = "\n".join([f"- **{t['name']}** ({t['count']:,} posts)" for t in tags[:20]])
+            # Use hardcoded popular tags list
+            tag_list = "\n".join([f"- **{tag}**" for tag in POPULAR_TAGS])
             yield fp.PartialResponse(text=f"## Popular Tags\n\n{tag_list}\n\nUse `/search <tag>` to browse posts.")
 
         elif query.startswith("/search "):
