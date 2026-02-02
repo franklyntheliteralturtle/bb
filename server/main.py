@@ -1430,20 +1430,17 @@ class SuperBrowserBot(fp.PoeBot):
 
             base_url = SERVER_URL if SERVER_URL else ""
             response = f"## Results for: {search_term} (page {page})\n\n"
-            response += "| Post | Score | Type | Censored |\n"
-            response += "|------|-------|------|----------|\n"
+            response += "| Post | Score | Type | Thumbnail | Censored |\n"
+            response += "|------|-------|------|-----------|----------|\n"
             for post in posts:
                 censored_url = f"{base_url}/media/{post['id']}"
-                response += f"| #{post['id']} | {post['score']} | {post['file_type']} | [View]({censored_url}) |\n"
-
-            response += f"\n**Thumbnails** (uncensored):\n"
-            for post in posts:
-                if post.get('sample_url'):
-                    response += f"- #{post['id']}: {post['sample_url']}\n"
+                thumb_url = post.get('sample_url', '')
+                thumb_link = f"[thumb]({thumb_url})" if thumb_url else "-"
+                response += f"| #{post['id']} | {post['score']} | {post['file_type']} | {thumb_link} | [View]({censored_url}) |\n"
 
             # Navigation hint
             if len(posts) == posts_per_page:
-                response += f"\n*More results: `/search {search_term} {page + 1}`*"
+                response += f"\n*More results:*\n```\n /search {search_term} {page + 1}\n```"
 
             yield fp.PartialResponse(text=response)
 
