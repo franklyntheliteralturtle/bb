@@ -7,17 +7,12 @@ Features automated nudity detection and censoring using direct ONNX inference.
 import os
 import io
 import json
-import hashlib
 import asyncio
-import tempfile
-import subprocess
-import shutil
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import AsyncIterable
 from contextlib import asynccontextmanager
-from urllib.parse import quote, urlencode
 
 import httpx
 import aiosqlite
@@ -115,21 +110,9 @@ DEFAULT_CENSOR_CLASSES = [
 CENSOR_CLASSES = os.getenv("CENSOR_CLASSES", "").split(",") if os.getenv("CENSOR_CLASSES") else DEFAULT_CENSOR_CLASSES
 CENSOR_CLASSES = [c.strip() for c in CENSOR_CLASSES if c.strip()]
 
-# Video processing configuration
-VIDEO_CACHE_DIR = Path(os.getenv("VIDEO_CACHE_DIR", "video_cache"))
-VIDEO_KEYFRAME_INTERVAL_SECONDS = float(os.getenv("VIDEO_KEYFRAME_INTERVAL_SECONDS", "1.0"))
-VIDEO_SCENE_CHANGE_THRESHOLD = float(os.getenv("VIDEO_SCENE_CHANGE_THRESHOLD", "0.15"))
-VIDEO_MAX_DURATION = int(os.getenv("VIDEO_MAX_DURATION", "60"))
-VIDEO_TARGET_FPS = int(os.getenv("VIDEO_TARGET_FPS", "15"))
-VIDEO_USE_DUAL_MODELS = os.getenv("VIDEO_USE_DUAL_MODELS", "false").lower() == "true"
-VIDEO_PRIMARY_MODEL = os.getenv("VIDEO_PRIMARY_MODEL", "320n")
-VIDEO_BATCH_SIZE = int(os.getenv("VIDEO_BATCH_SIZE", "20"))
-VIDEO_VERBOSE_LOGGING = os.getenv("VIDEO_VERBOSE_LOGGING", "true").lower() == "true"
-
 # Ensure directories exist
 MEDIA_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-VIDEO_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # =============================================================================
@@ -832,12 +815,10 @@ class NudeNetCensor:
         self,
         image_bytes: bytes,
         censor_classes: list[str] | None = None,
-        threshold: float = 0.25,
-        use_dual_models: bool = True,
-        primary_model: str = "320n"
+        threshold: float = 0.25
     ) -> tuple[bytes, list[dict]]:
         """
-        Detect and censor NSFW content in an image.
+        Detect and censor NSFW content in an image using both models.
 
         Returns:
             Tuple of (censored_image_bytes, list_of_detections)
@@ -845,18 +826,12 @@ class NudeNetCensor:
         if censor_classes is None:
             censor_classes = CENSOR_CLASSES
 
-        # Run detection with selected model(s)
-        if use_dual_models:
-            results_320n, results_640m = await asyncio.gather(
-                self.detector_320n.detect(image_bytes, threshold),
-                self.detector_640m.detect(image_bytes, threshold)
-            )
-            all_detections = results_320n + results_640m
-        else:
-            if primary_model == "640m":
-                all_detections = await self.detector_640m.detect(image_bytes, threshold)
-            else:
-                all_detections = await self.detector_320n.detect(image_bytes, threshold)
+        # Always run both models in parallel for best coverage
+        results_320n, results_640m = await asyncio.gather(
+            self.detector_320n.detect(image_bytes, threshold),
+            self.detector_640m.detect(image_bytes, threshold)
+        )
+        all_detections = results_320n + results_640m
 
         # Filter to censor classes
         to_censor = [d for d in all_detections if d["class"] in censor_classes]
@@ -885,177 +860,6 @@ class NudeNetCensor:
         output = io.BytesIO()
         image.save(output, format="JPEG", quality=90)
         return output.getvalue(), all_detections
-
-
-# =============================================================================
-# Video/GIF Processing
-# =============================================================================
-
-class VideoCensorProcessor:
-    """Process and censor videos/GIFs using FFmpeg and NudeNet."""
-
-    def __init__(self, censor: NudeNetCensor):
-        self.censor = censor
-        self._http_client: httpx.AsyncClient | None = None
-
-    @property
-    def http_client(self) -> httpx.AsyncClient:
-        if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=60.0, follow_redirects=True)
-        return self._http_client
-
-    async def close(self):
-        if self._http_client:
-            await self._http_client.aclose()
-            self._http_client = None
-
-    async def download_video(self, url: str) -> bytes:
-        """Download video from URL."""
-        response = await self.http_client.get(url)
-        response.raise_for_status()
-        return response.content
-
-    async def process_video(
-        self,
-        video_bytes: bytes,
-        output_format: str = "mp4",
-        max_duration: int | None = None
-    ) -> tuple[bytes, dict]:
-        """
-        Process and censor a video.
-
-        Returns:
-            Tuple of (censored_video_bytes, processing_stats)
-        """
-        max_duration = max_duration or VIDEO_MAX_DURATION
-
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
-            input_path = temp_path / "input.mp4"
-            frames_dir = temp_path / "frames"
-            censored_dir = temp_path / "censored"
-            output_path = temp_path / f"output.{output_format}"
-
-            frames_dir.mkdir()
-            censored_dir.mkdir()
-
-            # Write input video
-            input_path.write_bytes(video_bytes)
-
-            # Get video info
-            probe_cmd = [
-                "ffprobe", "-v", "error",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=width,height,r_frame_rate,duration",
-                "-of", "json",
-                str(input_path)
-            ]
-
-            probe_result = await asyncio.to_thread(
-                subprocess.run, probe_cmd, capture_output=True, text=True
-            )
-
-            video_info = {"width": 0, "height": 0, "fps": 30, "duration": 0}
-            try:
-                probe_data = json.loads(probe_result.stdout)
-                stream = probe_data.get("streams", [{}])[0]
-                video_info["width"] = int(stream.get("width", 0))
-                video_info["height"] = int(stream.get("height", 0))
-
-                fps_str = stream.get("r_frame_rate", "30/1")
-                if "/" in fps_str:
-                    num, den = map(int, fps_str.split("/"))
-                    video_info["fps"] = num / den if den else 30
-                else:
-                    video_info["fps"] = float(fps_str)
-
-                video_info["duration"] = float(stream.get("duration", 0))
-            except Exception as e:
-                print(f"[Video] Probe error: {e}")
-
-            # Limit duration
-            duration_limit = min(video_info["duration"], max_duration) if video_info["duration"] > 0 else max_duration
-
-            # Extract frames
-            target_fps = min(VIDEO_TARGET_FPS, video_info["fps"])
-            extract_cmd = [
-                "ffmpeg", "-y",
-                "-i", str(input_path),
-                "-t", str(duration_limit),
-                "-vf", f"fps={target_fps}",
-                "-q:v", "2",
-                str(frames_dir / "frame_%05d.jpg")
-            ]
-
-            await asyncio.to_thread(
-                subprocess.run, extract_cmd, capture_output=True
-            )
-
-            # Get frame files
-            frame_files = sorted(frames_dir.glob("frame_*.jpg"))
-            total_frames = len(frame_files)
-
-            if total_frames == 0:
-                raise RuntimeError("No frames extracted from video")
-
-            print(f"[Video] Processing {total_frames} frames...")
-
-            # Process frames in batches
-            stats = {
-                "total_frames": total_frames,
-                "censored_frames": 0,
-                "detections": 0
-            }
-
-            for i in range(0, total_frames, VIDEO_BATCH_SIZE):
-                batch = frame_files[i:i + VIDEO_BATCH_SIZE]
-
-                async def process_frame(frame_path: Path) -> tuple[Path, int]:
-                    frame_bytes = frame_path.read_bytes()
-                    censored_bytes, detections = await self.censor.censor_image(
-                        frame_bytes,
-                        use_dual_models=VIDEO_USE_DUAL_MODELS,
-                        primary_model=VIDEO_PRIMARY_MODEL,
-                        threshold=CENSOR_THRESHOLD
-                    )
-
-                    output_frame = censored_dir / frame_path.name
-                    output_frame.write_bytes(censored_bytes)
-
-                    return output_frame, len([d for d in detections if d["class"] in CENSOR_CLASSES])
-
-                results = await asyncio.gather(*[process_frame(f) for f in batch])
-
-                for _, detection_count in results:
-                    if detection_count > 0:
-                        stats["censored_frames"] += 1
-                        stats["detections"] += detection_count
-
-            # Reassemble video
-            encode_cmd = [
-                "ffmpeg", "-y",
-                "-framerate", str(target_fps),
-                "-i", str(censored_dir / "frame_%05d.jpg"),
-                "-c:v", "libx264",
-                "-preset", "fast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
-                "-movflags", "+faststart",
-                str(output_path)
-            ]
-
-            await asyncio.to_thread(
-                subprocess.run, encode_cmd, capture_output=True
-            )
-
-            if not output_path.exists():
-                raise RuntimeError("Failed to encode output video")
-
-            output_bytes = output_path.read_bytes()
-            stats["output_size"] = len(output_bytes)
-
-            print(f"[Video] Complete: {stats}")
-            return output_bytes, stats
 
 
 # =============================================================================
@@ -1191,12 +995,11 @@ async def get_cached_processed_media(media_id: str) -> dict | None:
 # =============================================================================
 
 class MediaProcessor:
-    """Service for processing and serving censored media."""
+    """Service for processing and serving censored images."""
 
     def __init__(self, censor: NudeNetCensor, rule34: Rule34Client):
         self.censor = censor
         self.rule34 = rule34
-        self.video_processor = VideoCensorProcessor(censor)
         self._http_client: httpx.AsyncClient | None = None
 
     @property
@@ -1213,7 +1016,6 @@ class MediaProcessor:
         if self._http_client:
             await self._http_client.aclose()
             self._http_client = None
-        await self.video_processor.close()
 
     def _generate_media_id(self, post_id: int) -> str:
         """Generate a unique ID for processed media."""
@@ -1221,7 +1023,7 @@ class MediaProcessor:
 
     async def get_or_process_media(self, post_id: int) -> tuple[str, str]:
         """
-        Get or process censored media for a post.
+        Get or process censored image for a post.
 
         Returns:
             Tuple of (file_path, media_type)
@@ -1245,52 +1047,38 @@ class MediaProcessor:
         file_url = post["file_url"]
         file_type = post["file_type"]
 
-        print(f"[Media] Processing post {post_id} ({file_type}): {file_url}")
+        # Only process images
+        if file_type != "image":
+            raise ValueError(f"Post {post_id} is not an image (type: {file_type})")
+
+        print(f"[Media] Processing post {post_id}: {file_url}")
 
         # Download original
         response = await self.http_client.get(file_url)
         response.raise_for_status()
         original_bytes = response.content
 
-        # Process based on type
-        if file_type == "video":
-            # Process video
-            processed_bytes, stats = await self.video_processor.process_video(original_bytes)
-            extension = "mp4"
-            media_type = "video"
-            detections = [{"stats": stats}]
-        elif file_type == "gif":
-            # Process GIF as video
-            processed_bytes, stats = await self.video_processor.process_video(
-                original_bytes, output_format="mp4"
-            )
-            extension = "mp4"
-            media_type = "gif"
-            detections = [{"stats": stats}]
-        else:
-            # Process image
-            processed_bytes, detections = await self.censor.censor_image(
-                original_bytes,
-                threshold=CENSOR_THRESHOLD
-            )
-            extension = "jpg"
-            media_type = "image"
+        # Process image with dual-model censoring
+        processed_bytes, detections = await self.censor.censor_image(
+            original_bytes,
+            threshold=CENSOR_THRESHOLD
+        )
 
         # Save to cache directory
-        file_path = MEDIA_CACHE_DIR / f"{media_id}.{extension}"
+        file_path = MEDIA_CACHE_DIR / f"{media_id}.jpg"
         file_path.write_bytes(processed_bytes)
 
         # Cache metadata
         await cache_processed_media(
             media_id=media_id,
             post_id=post_id,
-            media_type=media_type,
+            media_type="image",
             file_path=str(file_path),
             detections=detections
         )
 
         print(f"[Media] Saved processed media: {file_path}")
-        return str(file_path), media_type
+        return str(file_path), "image"
 
 
 # =============================================================================
@@ -1426,23 +1214,17 @@ async def get_post(post_id: int):
 
 @app.get("/media/{post_id}")
 async def get_media(post_id: int):
-    """Get censored media for a post."""
+    """Get censored image for a post. Displays directly in browser."""
     if not media_processor:
         return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
     try:
         file_path, media_type = await media_processor.get_or_process_media(post_id)
 
-        # Determine content type
-        if media_type == "video" or media_type == "gif":
-            content_type = "video/mp4"
-        else:
-            content_type = "image/jpeg"
-
+        # Return image to display in browser (no filename = inline display, not download)
         return FileResponse(
             file_path,
-            media_type=content_type,
-            filename=f"r34_{post_id}.{file_path.split('.')[-1]}"
+            media_type="image/jpeg"
         )
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
@@ -1536,7 +1318,7 @@ Commands:
 **REST API Endpoints:**
 - `GET /tags/popular` - Get popular tags
 - `GET /posts?tags=<tag>&page=0&limit=50` - Get posts (paginated)
-- `GET /media/<post_id>` - Get censored image/video
+- `GET /media/<post_id>` - Get censored image
 
 Use the canvas app for the full browsing experience!
             """)
