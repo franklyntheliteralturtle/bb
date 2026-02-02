@@ -1278,9 +1278,9 @@ async def health_check():
 @app.get("/tags/popular")
 async def get_popular_tags(
     limit: int = Query(50, ge=1, le=100),
-    order_by: str = Query("updated", regex="^(count|updated)$")
+    order_by: str = Query("count", regex="^(count|updated)$")
 ):
-    """Get popular/trending tags."""
+    """Get popular tags (by post count) or recently updated tags."""
     if not rule34_client:
         return JSONResponse({"error": "Service not initialized"}, status_code=503)
 
@@ -1401,9 +1401,10 @@ class SuperBrowserBot(fp.PoeBot):
 
         # Simple command routing
         if query.startswith("/tags"):
-            tags = await rule34_client.get_popular_tags(limit=20)
+            # Use order_by="count" for popular tags (most posts)
+            tags = await rule34_client.get_popular_tags(limit=20, order_by="count")
             tag_list = "\n".join([f"- **{t['name']}** ({t['count']:,} posts)" for t in tags[:20]])
-            yield fp.PartialResponse(text=f"## Trending Tags\n\n{tag_list}")
+            yield fp.PartialResponse(text=f"## Popular Tags\n\n{tag_list}\n\nUse `/search <tag>` to browse posts.")
 
         elif query.startswith("/search "):
             search_term = query[8:].strip()
@@ -1413,9 +1414,18 @@ class SuperBrowserBot(fp.PoeBot):
                 yield fp.PartialResponse(text=f"No posts found for: {search_term}")
                 return
 
+            base_url = SERVER_URL if SERVER_URL else ""
             response = f"## Results for: {search_term}\n\n"
+            response += "| Post | Score | Type | Censored |\n"
+            response += "|------|-------|------|----------|\n"
             for post in posts:
-                response += f"- Post #{post['id']} (score: {post['score']}) - {post['file_type']}\n"
+                censored_url = f"{base_url}/media/{post['id']}"
+                response += f"| #{post['id']} | {post['score']} | {post['file_type']} | [View]({censored_url}) |\n"
+
+            response += f"\n**Thumbnail URLs** (uncensored, from Rule34 CDN):\n"
+            for post in posts[:5]:
+                if post.get('sample_url'):
+                    response += f"- #{post['id']}: {post['sample_url']}\n"
 
             yield fp.PartialResponse(text=response)
 
@@ -1424,8 +1434,13 @@ class SuperBrowserBot(fp.PoeBot):
 ## Super Browser
 
 Commands:
-- `/tags` - View trending tags
+- `/tags` - View popular tags (by post count)
 - `/search <tag>` - Search posts by tag
+
+**REST API Endpoints:**
+- `GET /tags/popular` - Get popular tags
+- `GET /posts?tags=<tag>` - Get posts for a tag
+- `GET /media/<post_id>` - Get censored image/video
 
 Use the canvas app for the full browsing experience!
             """)
