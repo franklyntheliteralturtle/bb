@@ -1407,25 +1407,43 @@ class SuperBrowserBot(fp.PoeBot):
             yield fp.PartialResponse(text=f"## Popular Tags\n\n{tag_list}\n\nUse `/search <tag>` to browse posts.")
 
         elif query.startswith("/search "):
-            search_term = query[8:].strip()
-            posts = await rule34_client.get_posts(tags=search_term, limit=10)
+            # Parse: /search <tag> [page]
+            parts = query[8:].strip().split()
+            if not parts:
+                yield fp.PartialResponse(text="Usage: `/search <tag> [page]`")
+                return
+
+            # Check if last part is a page number
+            page = 0
+            if len(parts) > 1 and parts[-1].isdigit():
+                page = int(parts[-1])
+                search_term = " ".join(parts[:-1])
+            else:
+                search_term = " ".join(parts)
+
+            posts_per_page = 20
+            posts = await rule34_client.get_posts(tags=search_term, limit=posts_per_page, page=page)
 
             if not posts:
-                yield fp.PartialResponse(text=f"No posts found for: {search_term}")
+                yield fp.PartialResponse(text=f"No posts found for: {search_term} (page {page})")
                 return
 
             base_url = SERVER_URL if SERVER_URL else ""
-            response = f"## Results for: {search_term}\n\n"
+            response = f"## Results for: {search_term} (page {page})\n\n"
             response += "| Post | Score | Type | Censored |\n"
             response += "|------|-------|------|----------|\n"
             for post in posts:
                 censored_url = f"{base_url}/media/{post['id']}"
                 response += f"| #{post['id']} | {post['score']} | {post['file_type']} | [View]({censored_url}) |\n"
 
-            response += f"\n**Thumbnail URLs** (uncensored, from Rule34 CDN):\n"
-            for post in posts[:5]:
+            response += f"\n**Thumbnails** (uncensored):\n"
+            for post in posts:
                 if post.get('sample_url'):
                     response += f"- #{post['id']}: {post['sample_url']}\n"
+
+            # Navigation hint
+            if len(posts) == posts_per_page:
+                response += f"\n*More results: `/search {search_term} {page + 1}`*"
 
             yield fp.PartialResponse(text=response)
 
@@ -1434,12 +1452,13 @@ class SuperBrowserBot(fp.PoeBot):
 ## Super Browser
 
 Commands:
-- `/tags` - View popular tags (by post count)
-- `/search <tag>` - Search posts by tag
+- `/tags` - View popular tags
+- `/search <tag>` - Search posts by tag (page 0)
+- `/search <tag> <page>` - Search with pagination
 
 **REST API Endpoints:**
 - `GET /tags/popular` - Get popular tags
-- `GET /posts?tags=<tag>` - Get posts for a tag
+- `GET /posts?tags=<tag>&page=0&limit=50` - Get posts (paginated)
 - `GET /media/<post_id>` - Get censored image/video
 
 Use the canvas app for the full browsing experience!
