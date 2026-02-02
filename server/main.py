@@ -1342,12 +1342,14 @@ Use the canvas app for the full browsing experience!
 poe_bot = SuperBrowserBot()
 
 
-# Mount Poe bot endpoint
-app.add_api_route(
-    "/poe",
-    fp.make_app(poe_bot, access_key=POE_ACCESS_KEY).routes[0].endpoint,
-    methods=["POST"]
-)
+# Mount Poe bot endpoint at root (Poe sends POST to /)
+poe_app = fp.make_app(poe_bot, access_key=POE_ACCESS_KEY)
+
+@app.post("/")
+async def poe_handler(request: Request):
+    """Handle Poe bot requests at root path."""
+    # Forward to the Poe app
+    return await poe_app.routes[0].endpoint(request)
 
 
 # =============================================================================
